@@ -118,7 +118,7 @@ def parse_args():
         "--snapshot-freq",
         type=int,
         default=SNAPSHOT_FREQ,
-        help="every N steps (and at the end) also keep a copy named step<N>_loss<L>.pt; 0 disables",
+        help="every N steps (and at the end) also keep a copy named step<N>_bpb<B>.pt (training bits per byte); 0 disables",
     )
     g.add_argument(
         "--resume",
@@ -194,9 +194,12 @@ def save_checkpoint(model, optimizer, step):
 
 
 def snapshot_checkpoint(step, loss):
-    # copy latest.pt to a permanent, descriptive name that later saves won't overwrite
-    name = f"step{step:07d}" + (f"_loss{loss:.4f}" if loss is not None else "") + ".pt"
-    path = os.path.join(CKPT_DIR, name)
+    # copy latest.pt to a permanent, descriptive name that later saves won't overwrite;
+    # the name uses bits per byte, which is comparable across tokenizers (loss per token isn't)
+    name = f"step{step:07d}"
+    if loss is not None:
+        name += f"_bpb{loss / math.log(2) / BYTES_PER_TOKEN:.4f}"
+    path = os.path.join(CKPT_DIR, name + ".pt")
     shutil.copyfile(CKPT_PATH, path)
     print(f"Saved snapshot {path}")
 

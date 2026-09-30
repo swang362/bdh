@@ -59,7 +59,7 @@ data/
     tokenizer.model         sentencepiece datasets only
 checkpoints/
   latest.pt                 most recent checkpoint, used for resuming
-  step0005000_loss0.9123.pt snapshots kept every --snapshot-freq steps
+  step0005000_bpb0.5123.pt  snapshots kept every --snapshot-freq steps (named by training bits per byte)
 ```
 
 `data/`, `checkpoints/` and `input.txt` are git-ignored.

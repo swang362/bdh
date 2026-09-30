@@ -28,7 +28,7 @@ The checkpoint provides the model config, the tokenizer and the training block s
 
 ```
 python inference.py "Once upon a time"
-python inference.py "Once upon a time" --checkpoint checkpoints/ts_sp4096/step0040000_loss1.0123.pt
+python inference.py "Once upon a time" --checkpoint checkpoints/ts_sp4096/step0040000_bpb0.4123.pt
 python inference.py "ROMEO:" --max-new-tokens 500 --temperature 0.8 --top-k 10 --seed 42
 python inference.py "Once upon a time" --top-k 1          # greedy
 python inference.py "The end.<|endoftext|>" --max-new-tokens 300   # start a fresh story

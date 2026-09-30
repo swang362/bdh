@@ -54,7 +54,7 @@ The parameter count is about `3 × 128 × D² + 2 × vocab × D` at the default 
 | `--log-freq N` | 100 | Print a log line every N steps |
 | `--ckpt-freq N` | 500 | Save `<ckpt-dir>/latest.pt` every N steps |
 | `--ckpt-dir DIR` | `checkpoints` | Checkpoint folder. Use a separate one per experiment |
-| `--snapshot-freq N` | 5000 | Every N steps, and at the end, also keep a copy named `step<N>_loss<L>.pt`. `0` turns this off |
+| `--snapshot-freq N` | 5000 | Every N steps, and at the end, also keep a copy named `step<N>_bpb<B>.pt`, where B is the recent training bits per byte. `0` turns this off |
 | `--resume` / `--no-resume` | on | Resume from `<ckpt-dir>/latest.pt` if it exists |
 
 ### Sample after training
