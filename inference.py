@@ -9,7 +9,7 @@ from contextlib import nullcontext
 import bdh
 import tokenizer as tokenizers
 import torch
-import torch.nn.functional as F
+from recurrent import generate_stream_recurrent, sample_next
 
 DEFAULT_CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "latest.pt")
 
@@ -21,6 +21,11 @@ def parse_args():
     )
     parser.add_argument("--checkpoint", default=DEFAULT_CKPT_PATH)
     parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument(
+        "--recurrent",
+        action="store_true",
+        help="generate recurrently with a fixed-size state instead of re-reading the context for every token (see docs/recurrent.md)",
+    )
     parser.add_argument(
         "--context-size",
         type=int,
@@ -150,14 +155,21 @@ def generate_stream(model, idx, max_new_tokens, temperature=1.0, top_k=None, con
         # feed only the most recent context_size tokens (a sliding window)
         idx_cond = idx if context_size is None else idx[:, -context_size:]
         logits, _ = model(idx_cond)
-        logits = logits[:, -1, :] / temperature
-        if top_k is not None:
-            values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < values[:, [-1]]] = float("-inf")
-        probs = F.softmax(logits, dim=-1)
-        idx_next = torch.multinomial(probs, num_samples=1)
+        idx_next = sample_next(logits[:, -1, :], temperature, top_k)
         idx = torch.cat((idx, idx_next), dim=1)
         yield idx_next.item()
+
+
+def token_stream(model, prompt_ids, device, recurrent, max_new_tokens, temperature, top_k, context_size):
+    """Generated token ids, by re-reading the window each step or recurrently (see recurrent.py)."""
+    if recurrent:
+        return generate_stream_recurrent(
+            model, prompt_ids, max_new_tokens, temperature=temperature, top_k=top_k, context_size=context_size
+        )
+    idx = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
+    return generate_stream(
+        model, idx, max_new_tokens, temperature=temperature, top_k=top_k, context_size=context_size
+    )
 
 
 def main():
@@ -201,14 +213,14 @@ def main():
     print(
         f"Loaded {args.checkpoint} (step {checkpoint['step']}) on {device}, "
         f"{tok.type} tokenizer (vocab {tok.vocab_size}), "
-        f"context {context_size or 'unlimited'}",
+        f"context {context_size or 'unlimited'}"
+        + (", recurrent" if args.recurrent else ""),
         file=sys.stderr,
     )
 
     prompt_ids = tok.encode(args.prompt)
     if not prompt_ids:
         raise SystemExit("Prompt is empty")
-    prompt = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
 
     # a character can span several tokens (multi-byte UTF-8, byte fallback),
     # so text is decoded incrementally; the stop filter only sees generated text
@@ -234,13 +246,15 @@ def main():
     n_generated = 0
     emit(prompt_text)
     with ctx:
-        for token in generate_stream(
+        for token in token_stream(
             model,
-            prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            context_size=context_size or None,
+            prompt_ids,
+            device,
+            args.recurrent,
+            args.max_new_tokens,
+            args.temperature,
+            args.top_k,
+            context_size or None,
         ):
             if first_token_time is None:
                 first_token_time = time.perf_counter() - start

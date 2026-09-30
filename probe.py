@@ -25,7 +25,7 @@ import bdh
 import tokenizer as tokenizers
 import torch
 
-from inference import generate_stream
+from inference import token_stream
 
 # (prompt, accepted answers). A probe is correct if any answer appears as a whole
 # word (case-insensitive) in the greedy continuation. Most prompts follow
@@ -107,6 +107,11 @@ def parse_args():
         help="context window (default: the training block size saved in the checkpoint)",
     )
     p.add_argument("--verbose", action="store_true", help="print every completion")
+    p.add_argument(
+        "--recurrent",
+        action="store_true",
+        help="generate recurrently (docs/recurrent.md); scores should match the default method",
+    )
     p.add_argument("--csv", help="also write the per-checkpoint results to this CSV file")
     p.add_argument("--cpu", action="store_true", help="run on CPU even if a GPU is available")
     return p.parse_args()
@@ -153,12 +158,11 @@ def probe_checkpoint(path, probes, args, device, ctx):
     results = []
     for prompt, answers in probes:
         ids = tok.encode(prompt)
-        idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
         with ctx:
             # top_k=1 is greedy decoding: deterministic, the model's single best guess
             new = list(
-                generate_stream(
-                    model, idx, args.max_new_tokens, top_k=1, context_size=context_size or None
+                token_stream(
+                    model, ids, device, args.recurrent, args.max_new_tokens, 1.0, 1, context_size or None
                 )
             )
         # decode the whole sequence and cut the prompt, so text spanning the

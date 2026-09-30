@@ -20,7 +20,7 @@ import torch
 
 import chat_format
 import tokenizer as tokenizers
-from inference import StopAtText, generate_stream
+from inference import StopAtText, token_stream
 
 DEFAULT_CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "chat", "best.pt")
 
@@ -38,6 +38,11 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=20)
     p.add_argument("--context-size", type=int, default=None, help="context window (default: the checkpoint's block size)")
     p.add_argument("--no-history", action="store_true", help="answer each question independently")
+    p.add_argument(
+        "--recurrent",
+        action="store_true",
+        help="generate recurrently with a fixed-size state: faster, especially in long conversations (see docs/recurrent.md)",
+    )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--cpu", action="store_true", help="run on CPU even if a GPU is available")
     return p.parse_args()
@@ -59,11 +64,12 @@ def load_model(path, device):
     return model, tok, info
 
 
-def generate_reply(model, tok, messages, context_size, max_new_tokens=256, temperature=0.7, top_k=20, on_text=None):
+def generate_reply(
+    model, tok, messages, context_size, max_new_tokens=256, temperature=0.7, top_k=20, on_text=None, recurrent=False
+):
     """Generate the assistant's reply to messages; on_text receives text as it streams."""
     ids, _ = chat_format.encode(tok, messages, add_generation_prompt=True)
     device = next(model.parameters()).device
-    idx = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     decoder = tok.stream_decoder()
     decoder.feed(ids)  # the prompt itself is not printed
     stop = StopAtText(chat_format.STOP_STRINGS)
@@ -75,8 +81,8 @@ def generate_reply(model, tok, messages, context_size, max_new_tokens=256, tempe
             if on_text:
                 on_text(text)
 
-    for token in generate_stream(
-        model, idx, max_new_tokens, temperature=temperature, top_k=top_k, context_size=context_size or None
+    for token in token_stream(
+        model, ids, device, recurrent, max_new_tokens, temperature, top_k, context_size or None
     ):
         emit(stop.feed(decoder.feed([token])))
         if stop.stopped:
@@ -99,7 +105,11 @@ def main():
     model, tok, info = load_model(args.checkpoint, device)
     context_size = args.context_size if args.context_size is not None else info["block_size"]
     system = args.system if args.system is not None else (info["chat"] or {}).get("system")
-    print(f"Loaded {args.checkpoint} (step {info['step']}) on {device}, context {context_size}", file=sys.stderr)
+    print(
+        f"Loaded {args.checkpoint} (step {info['step']}) on {device}, context {context_size or 'unlimited'}"
+        + (", recurrent" if args.recurrent else ""),
+        file=sys.stderr,
+    )
     if not info["chat"]:
         print(
             "Warning: this checkpoint was not fine-tuned for chat (run finetune.py); "
@@ -114,6 +124,7 @@ def main():
             reply = generate_reply(
                 model, tok, messages, context_size, args.max_new_tokens, args.temperature, args.top_k,
                 on_text=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                recurrent=args.recurrent,
             )
         print()
         return reply

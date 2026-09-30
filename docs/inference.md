@@ -16,6 +16,7 @@ The checkpoint provides the model config, the tokenizer and the training block s
 | `--checkpoint FILE` | `checkpoints/latest.pt` | Checkpoint or snapshot to load |
 | `--max-new-tokens N` | 200 | Maximum tokens to generate |
 | `--context-size N` | training block size from the checkpoint | How many recent tokens the model sees at each step. `0` means unlimited (not recommended, see below) |
+| `--recurrent` | off | Generate with a fixed-size recurrent state instead of re-reading the context for every token. Much less compute per token, and constant speed however long the output. Identical output while prompt plus output fit in the context window. See [recurrent.md](recurrent.md) |
 | `--temperature T` | 1.0 | Sampling temperature; lower is more predictable. Must be above 0 |
 | `--top-k K` | 3 | Only sample from the K most likely tokens. `--top-k 1` always picks the most likely token (greedy) |
 | `--seed N` | none | Makes the output reproducible |
@@ -65,6 +66,7 @@ BDH's attention adds up contributions from all previous tokens without normaliza
 - **Long outputs stay fluent,** but the model can't see anything older than the window. In long outputs it may forget names or earlier details.
 - **Checkpoints from before `block_size` was saved** fall back to 512 and print a warning. Pass `--context-size` if you trained with a different `--block-size`.
 - **Speed stays constant** per token, however long the output gets.
+- **With `--recurrent`,** the same window applies, but each step costs far less: the model keeps a running memory instead of re-reading the window. Past the window there's one small difference in how older tokens are represented; [recurrent.md](recurrent.md) explains it.
 
 ## Tips
 

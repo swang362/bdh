@@ -7,6 +7,7 @@ This folder documents the command-line scripts for training and running BDH mode
 | `prepare_data.py` | Download or split a dataset, optionally train a tokenizer, write `train.bin` / `val.bin` | [prepare_data.md](prepare_data.md) |
 | `train.py` | Train a model, with checkpointing, resuming, snapshots and an LR schedule | [train.md](train.md) |
 | `inference.py` | Generate text from a checkpoint | [inference.md](inference.md) |
+| `recurrent.py`, `test_recurrent.py` | Recurrent generation mode (`--recurrent` in `inference.py`, `chat.py` and `probe.py`), and a test that it matches the default method | [recurrent.md](recurrent.md) |
 | `probe.py` | Score fact recall of checkpoints with greedy completions | [probe.md](probe.md) |
 | `finetune.py` | Fine-tune a checkpoint on question-and-answer data for chat | [chat.md](chat.md) |
 | `chat.py` | Chat with, or ask questions to, a fine-tuned checkpoint | [chat.md](chat.md) |

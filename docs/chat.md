@@ -111,6 +111,7 @@ python chat.py [question] [--checkpoint FILE] [options]
 | `--top-k K` | 20 | Sample from the K most likely tokens. `--top-k 1` is greedy, best for factual questions |
 | `--context-size N` | checkpoint's block size | Context window. Long conversations keep only the most recent tokens |
 | `--no-history` | off | Answer each question independently |
+| `--recurrent` | off | Generate with a fixed-size recurrent state: faster, especially in long conversations. Same replies while the conversation fits in the context window. See [recurrent.md](recurrent.md) |
 | `--seed N` | none | Reproducible sampling |
 | `--cpu` | off | Run on the CPU |
 
