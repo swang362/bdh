@@ -58,29 +58,33 @@ def parse_args():
 class StopAtText:
     """Passes text through until a stop string appears, then drops it and the rest.
 
-    A suffix that could be the start of the stop string is held back, so a
-    partially generated <|endoftext|> is never printed.
+    stops is one string, a list of strings, or None. A suffix that could be the
+    start of a stop string is held back, so a partially generated <|endoftext|>
+    is never printed.
     """
 
-    def __init__(self, stop):
-        self.stop = stop
+    def __init__(self, stops):
+        if isinstance(stops, str):
+            stops = [stops]
+        self.stops = [s for s in (stops or []) if s]
         self.buf = ""
         self.stopped = False
 
     def feed(self, text):
-        if not self.stop or self.stopped:
+        if not self.stops or self.stopped:
             return "" if self.stopped else text
         self.buf += text
-        i = self.buf.find(self.stop)
-        if i >= 0:
+        hits = [i for i in (self.buf.find(s) for s in self.stops) if i >= 0]
+        if hits:
             self.stopped = True
-            out, self.buf = self.buf[:i], ""
+            out, self.buf = self.buf[: min(hits)], ""
             return out
         keep = 0
-        for k in range(min(len(self.stop) - 1, len(self.buf)), 0, -1):
-            if self.stop.startswith(self.buf[-k:]):
-                keep = k
-                break
+        for stop in self.stops:
+            for k in range(min(len(stop) - 1, len(self.buf)), keep, -1):
+                if stop.startswith(self.buf[-k:]):
+                    keep = k
+                    break
         out = self.buf[: len(self.buf) - keep]
         self.buf = self.buf[len(self.buf) - keep :]
         return out
