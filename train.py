@@ -10,6 +10,7 @@ from contextlib import nullcontext
 
 import bdh
 import numpy as np
+import tokenizer as tokenizers
 import requests
 import torch
 import torch.nn as nn
@@ -61,6 +62,9 @@ RESUME = True  # resume from CKPT_PATH if it exists
 DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(__file__), "input.txt")
 input_file_path = DEFAULT_INPUT_PATH
 data_dir = None  # directory with train.bin / val.bin from prepare_data.py
+TOKENIZER = tokenizers.ByteTokenizer()  # replaced by the data dir's tokenizer, see __main__
+DATA_DTYPE = np.uint8  # dtype of the token ids in train.bin / val.bin
+BYTES_PER_TOKEN = 1.0  # average text bytes per token, for reporting bits per byte
 
 
 def parse_args():
@@ -72,7 +76,7 @@ def parse_args():
     g = p.add_argument_group("training")
     g.add_argument("--max-iters", type=int, default=MAX_ITERS, help="total training steps")
     g.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="sequences per step")
-    g.add_argument("--block-size", type=int, default=BLOCK_SIZE, help="sequence length in bytes")
+    g.add_argument("--block-size", type=int, default=BLOCK_SIZE, help="sequence length in tokens")
     g.add_argument("--lr", type=float, default=LEARNING_RATE, help="peak AdamW learning rate")
     g.add_argument(
         "--lr-schedule",
@@ -124,7 +128,7 @@ def parse_args():
     )
     g = p.add_argument_group("sample after training")
     g.add_argument("--prompt", default="To be or ", help="prompt for the sample generated after training")
-    g.add_argument("--sample-tokens", type=int, default=100, help="number of bytes to generate (0 to skip sampling)")
+    g.add_argument("--sample-tokens", type=int, default=100, help="number of tokens to generate (0 to skip sampling)")
     return p.parse_args()
 
 
@@ -139,10 +143,10 @@ def fetch_data():
 
 
 def get_batch(split):
-    # treat the file as bytes
     if data_dir is not None:
-        data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=np.uint8, mode="r")
+        data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=DATA_DTYPE, mode="r")
     else:
+        # plain text file: treat the file as bytes
         data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
         if split == "train":
             data = data[: int(0.9 * len(data))]
@@ -177,6 +181,7 @@ def save_checkpoint(model, optimizer, step):
         "scaler": scaler.state_dict(),
         "step": step,  # number of completed steps, i.e. the next step to run
         "config": dataclasses.asdict(BDH_CONFIG),
+        "tokenizer": tokenizers.to_state(TOKENIZER),
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
@@ -197,6 +202,14 @@ def snapshot_checkpoint(step, loss):
 
 def load_checkpoint(model, optimizer):
     checkpoint = torch.load(CKPT_PATH, map_location=device, weights_only=True)
+    # checkpoints from before tokenizer support have no entry and are byte-level
+    ckpt_tokenizer = tokenizers.from_state(checkpoint.get("tokenizer"))
+    if not tokenizers.same_tokenizer(ckpt_tokenizer, TOKENIZER):
+        raise ValueError(
+            f"Checkpoint {CKPT_PATH} uses a different tokenizer "
+            f"({ckpt_tokenizer.type}, vocab {ckpt_tokenizer.vocab_size}) than the data "
+            f"({TOKENIZER.type}, vocab {TOKENIZER.vocab_size}); use another --ckpt-dir or --no-resume"
+        )
     if checkpoint["config"] != dataclasses.asdict(BDH_CONFIG):
         raise ValueError(
             f"Checkpoint config {checkpoint['config']} does not match "
@@ -241,12 +254,30 @@ def eval(model):
 if __name__ == "__main__":
     args = parse_args()
     # override the module-level configuration used by the functions above
+    input_file_path = args.data
+    data_dir = args.data_dir
+    if data_dir is None:
+        fetch_data()
+    else:
+        for split in ("train", "val"):
+            path = os.path.join(data_dir, f"{split}.bin")
+            if not os.path.exists(path):
+                raise SystemExit(f"{path} not found (run prepare_data.py first)")
+        meta = tokenizers.load_meta(data_dir)
+        TOKENIZER = tokenizers.from_data_dir(data_dir)
+        DATA_DTYPE = np.dtype(meta.get("dtype", "uint8"))
+        BYTES_PER_TOKEN = meta.get("bytes_per_token", 1.0)
+        print(
+            f"Using dataset {data_dir} ({TOKENIZER.type} tokenizer, "
+            f"vocab {TOKENIZER.vocab_size}, {BYTES_PER_TOKEN:.2f} bytes/token)"
+        )
     BDH_CONFIG = bdh.BDHConfig(
         n_layer=args.n_layer,
         n_embd=args.n_embd,
         n_head=args.n_head,
         dropout=args.dropout,
         mlp_internal_dim_multiplier=args.mlp_mult,
+        vocab_size=TOKENIZER.vocab_size,
     )
     BLOCK_SIZE = args.block_size
     BATCH_SIZE = args.batch_size
@@ -262,18 +293,7 @@ if __name__ == "__main__":
     CKPT_PATH = os.path.join(CKPT_DIR, "latest.pt")
     SNAPSHOT_FREQ = args.snapshot_freq
     RESUME = args.resume
-    input_file_path = args.data
-    data_dir = args.data_dir
     torch.manual_seed(args.seed)
-
-    if data_dir is None:
-        fetch_data()
-    else:
-        for split in ("train", "val"):
-            path = os.path.join(data_dir, f"{split}.bin")
-            if not os.path.exists(path):
-                raise SystemExit(f"{path} not found (run prepare_data.py first)")
-        print(f"Using dataset {data_dir}")
 
     raw_model = bdh.BDH(BDH_CONFIG).to(device)
     n_params = sum(p.numel() for p in raw_model.parameters())
@@ -320,11 +340,13 @@ if __name__ == "__main__":
             completed_steps = step + 1
             if step % LOG_FREQ == 0:
                 avg_loss = loss_acc.item() / loss_steps  # .item() also syncs the GPU
+                # bits per byte is comparable across tokenizers, unlike loss per token
+                bpb = avg_loss / math.log(2) / BYTES_PER_TOKEN
                 now = time.perf_counter()
                 window_time = now - window_start
                 tok_per_sec = loss_steps * tokens_per_step / window_time
                 print(
-                    f"Step: {step}/{MAX_ITERS} loss {avg_loss:.3} | lr {lr:.2e} | "
+                    f"Step: {step}/{MAX_ITERS} loss {avg_loss:.3} ({bpb:.3f} bpb) | lr {lr:.2e} | "
                     f"{window_time * 1000 / loss_steps:.1f} ms/step | "
                     f"{tok_per_sec:,.0f} tok/s | elapsed {now - train_start:.1f}s"
                 )
@@ -361,7 +383,7 @@ if __name__ == "__main__":
         print("Training done, now generating a sample ")
         model.eval()
         prompt = torch.tensor(
-            bytearray(args.prompt, "utf-8"), dtype=torch.long, device=device
+            TOKENIZER.encode(args.prompt), dtype=torch.long, device=device
         ).unsqueeze(0)
         max_new_tokens = args.sample_tokens
         sync()
@@ -369,9 +391,7 @@ if __name__ == "__main__":
         ret = model.generate(prompt, max_new_tokens=max_new_tokens, top_k=3)
         sync()
         gen_time = time.perf_counter() - gen_start
-        ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
-            errors="backslashreplace"
-        )
+        ret_decoded = TOKENIZER.decode(ret.squeeze(0).tolist())
         print(ret_decoded)
         print(
             f"Generated {max_new_tokens} tokens in {gen_time:.2f}s "

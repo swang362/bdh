@@ -2,24 +2,37 @@
 
 """Prepare a dataset as train.bin / val.bin for train.py --data-dir.
 
-The model is byte-level (vocab_size=256), so each .bin file is simply the raw
-UTF-8 bytes of the text, read by train.py as a uint8 memmap. Files are
-streamed in chunks, so multi-GB datasets never need to fit in memory.
+Two tokenizers are supported:
+- bytes (default): each UTF-8 byte is a token (vocab 256), so the .bin files
+  are simply the raw text, stored as uint8.
+- sentencepiece: a BPE tokenizer is trained on the training split (or loaded
+  with --tokenizer-model) and the text is encoded to uint16 token ids.
+  Special tokens such as <|endoftext|> become single tokens.
+
+Raw downloads are cached in <out-dir>/raw/<dataset>/, so preparing the same
+dataset with another tokenizer doesn't download it again. Files are streamed
+in chunks, so multi-GB datasets never need to fit in memory.
 
 Examples:
     python prepare_data.py tinystories
+    python prepare_data.py tinystories --tokenizer sentencepiece --vocab-size 4096
     python prepare_data.py tinystories --max-train-bytes 100_000_000
     python prepare_data.py shakespeare
     python prepare_data.py text --input my_corpus.txt --name my_corpus
 """
 
 import argparse
+import itertools
 import json
 import os
 
+import numpy as np
 import requests
 
+from tokenizer import EOT, SentencePieceTokenizer
+
 CHUNK_SIZE = 16 * 1024 * 1024
+ENCODE_PIECE_SIZE = 1024 * 1024  # text per sentencepiece call, for multithreaded encoding
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
@@ -33,86 +46,200 @@ def fmt_bytes(n):
         n /= 1024
 
 
-def download(url, dst, max_bytes=None):
-    """Stream url to dst, stopping after max_bytes if given. Returns bytes written."""
+def download(url, dst):
+    """Stream url to dst unless it already exists."""
+    if os.path.exists(dst):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp = dst + ".part"
     written = 0
     with requests.get(url, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0)) or None
-        if max_bytes is not None:
-            total = min(total, max_bytes) if total else max_bytes
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if max_bytes is not None:
-                    chunk = chunk[: max_bytes - written]
                 f.write(chunk)
                 written += len(chunk)
                 pct = f" ({100 * written / total:.0f}%)" if total else ""
                 print(f"\r  {os.path.basename(dst)}: {fmt_bytes(written)}{pct}", end="")
-                if max_bytes is not None and written >= max_bytes:
-                    break
     print()
     os.replace(tmp, dst)
-    return written
 
 
-def copy_range(src, dst, start, length):
-    """Copy length bytes of src starting at start into dst. Returns bytes written."""
-    written = 0
-    with open(src, "rb") as fin, open(dst, "wb") as fout:
-        fin.seek(start)
-        while written < length:
-            chunk = fin.read(min(CHUNK_SIZE, length - written))
+# A source is (path, start, length): a byte range of a text file.
+
+
+def whole_file(path):
+    return (path, 0, os.path.getsize(path))
+
+
+def align_to_line(path, pos):
+    """Move pos forward to just after the next newline, so ranges split whole lines."""
+    size = os.path.getsize(path)
+    if pos <= 0 or pos >= size:
+        return max(0, min(pos, size))
+    with open(path, "rb") as f:
+        f.seek(pos)
+        while True:
+            block = f.read(1024 * 1024)
+            if not block:
+                return size
+            i = block.find(b"\n")
+            if i >= 0:
+                return pos + i + 1
+            pos += len(block)
+
+
+def split_file(path, val_fraction):
+    """Split one text file at a line boundary: first part train, last part val."""
+    size = os.path.getsize(path)
+    cut = align_to_line(path, int(size * (1 - val_fraction)))
+    return (path, 0, cut), (path, cut, size - cut)
+
+
+def truncate(src, max_bytes):
+    path, start, length = src
+    if max_bytes is None or length <= max_bytes:
+        return src
+    return (path, start, align_to_line(path, start + max_bytes) - start)
+
+
+def read_chunks(src, text=False):
+    """Yield the bytes (or text, split at line boundaries) of a source range."""
+    path, start, length = src
+    remaining = length
+    carry = b""
+    with open(path, "rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            chunk = f.read(min(CHUNK_SIZE, remaining))
             if not chunk:
                 break
-            fout.write(chunk)
+            remaining -= len(chunk)
+            if not text:
+                yield chunk
+                continue
+            chunk = carry + chunk
+            # keep a trailing partial line for the next chunk so no line (or
+            # multi-byte character) is split between two encode calls
+            cut = chunk.rfind(b"\n") + 1 if remaining > 0 else len(chunk)
+            if cut == 0:
+                carry = chunk
+                continue
+            carry = chunk[cut:]
+            yield chunk[:cut].decode("utf-8", errors="replace")
+    if text and carry:
+        yield carry.decode("utf-8", errors="replace")
+
+
+def write_bytes(src, dst):
+    """Byte tokenizer: the .bin file is the raw text. Returns tokens written."""
+    written = 0
+    with open(dst, "wb") as f:
+        for chunk in read_chunks(src):
+            f.write(chunk)
             written += len(chunk)
     return written
 
 
-def split_text_file(src, out_dir, val_fraction, max_train_bytes):
-    """Split one text file by byte position: first part train, last part val."""
-    size = os.path.getsize(src)
-    n_val = int(size * val_fraction)
-    n_train = size - n_val
-    if max_train_bytes is not None:
-        n_train = min(n_train, max_train_bytes)
-    train = copy_range(src, os.path.join(out_dir, "train.bin"), 0, n_train)
-    val = copy_range(src, os.path.join(out_dir, "val.bin"), size - n_val, n_val)
-    return train, val
+def split_pieces(text, size):
+    """Split text into pieces of about size characters at line boundaries."""
+    pieces, start = [], 0
+    while start < len(text):
+        end = text.find("\n", start + size)
+        end = len(text) if end < 0 else end + 1
+        pieces.append(text[start:end])
+        start = end
+    return pieces
 
 
-def prepare_tinystories(out_dir, args):
+def write_tokens(tok, src, dst):
+    """Encode a source range with sentencepiece into dst. Returns tokens written."""
+    written = 0
+    done = 0
+    threads = os.cpu_count() or 1
+    with open(dst, "wb") as f:
+        for text in read_chunks(src, text=True):
+            pieces = split_pieces(text, ENCODE_PIECE_SIZE)
+            try:
+                ids = tok.sp.encode(pieces, num_threads=threads)
+            except TypeError:  # older sentencepiece without num_threads
+                ids = tok.sp.encode(pieces)
+            n = sum(len(x) for x in ids)
+            np.fromiter(itertools.chain.from_iterable(ids), dtype=tok.dtype, count=n).tofile(f)
+            written += n
+            done += len(text.encode("utf-8"))
+            print(
+                f"\r  {os.path.basename(dst)}: {written:,} tokens "
+                f"({100 * done / max(1, src[2]):.0f}%)",
+                end="",
+            )
+    print()
+    return written
+
+
+def train_sentencepiece(src, out_dir, args):
+    import sentencepiece as spm
+
+    path, start, length = src
+    input_path = path
+    if start != 0 or length != os.path.getsize(path):
+        # train only on the training range (never on validation text)
+        input_path = os.path.join(out_dir, "tokenizer_train.txt")
+        write_bytes(src, input_path)
+    prefix = os.path.join(out_dir, "tokenizer")
+    print(f"Training sentencepiece BPE tokenizer, vocab {args.vocab_size}")
+    spm.SentencePieceTrainer.train(
+        input=input_path,
+        model_prefix=prefix,
+        model_type="bpe",
+        vocab_size=args.vocab_size,
+        user_defined_symbols=args.special_tokens,  # always kept as single tokens
+        byte_fallback=True,  # unknown characters become byte tokens, never <unk>
+        character_coverage=1.0,
+        # keep the text exactly as is, so decode(encode(text)) == text
+        normalization_rule_name="identity",
+        remove_extra_whitespaces=False,
+        add_dummy_prefix=False,
+        allow_whitespace_only_pieces=True,
+        split_digits=True,
+        bos_id=-1,
+        eos_id=-1,
+        input_sentence_size=args.tokenizer_sample_lines,
+        shuffle_input_sentence=True,
+        max_sentence_length=16384,
+        num_threads=os.cpu_count() or 1,
+    )
+    if input_path != path:
+        os.remove(input_path)
+    return prefix + ".model"
+
+
+def sources_tinystories(args):
     # TinyStories ships its own train/valid split; stories are separated by <|endoftext|>
-    train = download(
-        TINYSTORIES_URL.format(split="train"),
-        os.path.join(out_dir, "train.bin"),
-        max_bytes=args.max_train_bytes,
-    )
-    val = download(
-        TINYSTORIES_URL.format(split="valid"), os.path.join(out_dir, "val.bin")
-    )
-    return train, val
+    raw = os.path.join(args.out_dir, "raw", "tinystories")
+    train, val = os.path.join(raw, "train.txt"), os.path.join(raw, "valid.txt")
+    download(TINYSTORIES_URL.format(split="train"), train)
+    download(TINYSTORIES_URL.format(split="valid"), val)
+    return whole_file(train), whole_file(val)
 
 
-def prepare_shakespeare(out_dir, args):
-    raw = os.path.join(out_dir, "input.txt")
-    if not os.path.exists(raw):
-        download(SHAKESPEARE_URL, raw)
-    return split_text_file(raw, out_dir, args.val_fraction, args.max_train_bytes)
+def sources_shakespeare(args):
+    raw = os.path.join(args.out_dir, "raw", "shakespeare", "input.txt")
+    download(SHAKESPEARE_URL, raw)
+    return split_file(raw, args.val_fraction)
 
 
-def prepare_text(out_dir, args):
+def sources_text(args):
     if not os.path.exists(args.input):
         raise SystemExit(f"Input file not found: {args.input}")
-    return split_text_file(args.input, out_dir, args.val_fraction, args.max_train_bytes)
+    return split_file(args.input, args.val_fraction)
 
 
 DATASETS = {
-    "tinystories": prepare_tinystories,
-    "shakespeare": prepare_shakespeare,
-    "text": prepare_text,
+    "tinystories": sources_tinystories,
+    "shakespeare": sources_shakespeare,
+    "text": sources_text,
 }
 
 
@@ -124,12 +251,13 @@ def parse_args():
     p.add_argument("dataset", choices=DATASETS, help="dataset to prepare")
     p.add_argument("--input", help="text file to split (required for 'text')")
     p.add_argument(
-        "--name", help="output subdirectory name (defaults to the dataset name)"
+        "--name",
+        help="output subdirectory name (default: dataset name, plus _sp<vocab> for sentencepiece)",
     )
     p.add_argument(
         "--out-dir",
         default=os.path.join(ROOT, "data"),
-        help="parent directory for prepared datasets",
+        help="parent directory for prepared datasets (raw downloads go to <out-dir>/raw)",
     )
     p.add_argument(
         "--val-fraction",
@@ -142,6 +270,25 @@ def parse_args():
         type=lambda s: int(s.replace("_", "")),
         default=None,
         help="truncate the training split, e.g. 100_000_000 for a quick experiment",
+    )
+    g = p.add_argument_group("tokenizer")
+    g.add_argument("--tokenizer", choices=["bytes", "sentencepiece"], default="bytes")
+    g.add_argument("--vocab-size", type=int, default=4096, help="sentencepiece vocab size")
+    g.add_argument(
+        "--special-tokens",
+        nargs="*",
+        default=[EOT],
+        help="sentencepiece tokens that are never split",
+    )
+    g.add_argument(
+        "--tokenizer-model",
+        help="reuse an existing sentencepiece .model instead of training one",
+    )
+    g.add_argument(
+        "--tokenizer-sample-lines",
+        type=int,
+        default=2_000_000,
+        help="lines sampled from the training split to train the tokenizer",
     )
     args = p.parse_args()
     if args.dataset == "text" and not args.input:
@@ -156,26 +303,55 @@ def main():
         if args.dataset == "text"
         else args.dataset
     )
+    if not args.name and args.tokenizer == "sentencepiece":
+        name += f"_sp{args.vocab_size}" if not args.tokenizer_model else "_sp"
     out_dir = os.path.join(args.out_dir, name)
     os.makedirs(out_dir, exist_ok=True)
-    print(f"Preparing {args.dataset} into {out_dir}")
+    print(f"Preparing {args.dataset} into {out_dir} ({args.tokenizer} tokenizer)")
 
-    train_bytes, val_bytes = DATASETS[args.dataset](out_dir, args)
+    train_src, val_src = DATASETS[args.dataset](args)
+    train_src = truncate(train_src, args.max_train_bytes)
+    train_path = os.path.join(out_dir, "train.bin")
+    val_path = os.path.join(out_dir, "val.bin")
 
-    meta = {
-        "dataset": args.dataset,
-        "source": args.input,
-        "tokenizer": "bytes",
-        "vocab_size": 256,
-        "dtype": "uint8",
-        "train_tokens": train_bytes,
-        "val_tokens": val_bytes,
-    }
+    meta = {"dataset": args.dataset, "source": args.input}
+    if args.tokenizer == "bytes":
+        train_tokens = write_bytes(train_src, train_path)
+        val_tokens = write_bytes(val_src, val_path)
+        meta.update(tokenizer="bytes", vocab_size=256, dtype="uint8")
+    else:
+        model_path = os.path.join(out_dir, "tokenizer.model")
+        if args.tokenizer_model:
+            with open(args.tokenizer_model, "rb") as fin, open(model_path, "wb") as fout:
+                fout.write(fin.read())
+        else:
+            train_sentencepiece(train_src, out_dir, args)
+        tok = SentencePieceTokenizer.from_file(model_path)
+        train_tokens = write_tokens(tok, train_src, train_path)
+        val_tokens = write_tokens(tok, val_src, val_path)
+        meta.update(
+            tokenizer="sentencepiece",
+            tokenizer_model="tokenizer.model",
+            vocab_size=tok.vocab_size,
+            dtype=tok.dtype,
+            special_tokens=[t for t in args.special_tokens if tok.token_id(t) is not None],
+        )
+
+    train_bytes, val_bytes = train_src[2], val_src[2]
+    meta.update(
+        train_tokens=train_tokens,
+        val_tokens=val_tokens,
+        train_bytes=train_bytes,
+        val_bytes=val_bytes,
+        # for comparing losses across tokenizers: bits/byte = loss / ln(2) / bytes_per_token
+        bytes_per_token=train_bytes / max(1, train_tokens),
+    )
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"train.bin: {train_bytes:,} tokens ({fmt_bytes(train_bytes)})")
-    print(f"val.bin:   {val_bytes:,} tokens ({fmt_bytes(val_bytes)})")
+    print(f"train.bin: {train_tokens:,} tokens from {fmt_bytes(train_bytes)}")
+    print(f"val.bin:   {val_tokens:,} tokens from {fmt_bytes(val_bytes)}")
+    print(f"{meta['bytes_per_token']:.2f} bytes/token, vocab {meta['vocab_size']}")
     print(f"Train with: python train.py --data-dir {out_dir}")
 
 
