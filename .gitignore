@@ -1,3 +1,5 @@
-input.txt
+__pycache__
+.venv/
 checkpoints/
 data/
+input.txt

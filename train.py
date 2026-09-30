@@ -2,6 +2,7 @@
 
 import argparse
 import dataclasses
+import math
 import os
 import time
 from contextlib import nullcontext
@@ -45,6 +46,9 @@ BLOCK_SIZE = 512
 BATCH_SIZE = 32
 MAX_ITERS = 3000
 LEARNING_RATE = 1e-3
+LR_SCHEDULE = "cosine"  # "cosine" (decay to MIN_LR) or "constant"
+WARMUP_ITERS = 200  # linear warmup from ~0 to LEARNING_RATE
+MIN_LR = LEARNING_RATE / 10  # final lr at MAX_ITERS for the cosine schedule
 WEIGHT_DECAY = 0.1
 LOG_FREQ = 100
 CKPT_FREQ = 500  # save a checkpoint every CKPT_FREQ steps
@@ -67,7 +71,15 @@ def parse_args():
     g.add_argument("--max-iters", type=int, default=MAX_ITERS, help="total training steps")
     g.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="sequences per step")
     g.add_argument("--block-size", type=int, default=BLOCK_SIZE, help="sequence length in bytes")
-    g.add_argument("--lr", type=float, default=LEARNING_RATE, help="AdamW learning rate")
+    g.add_argument("--lr", type=float, default=LEARNING_RATE, help="peak AdamW learning rate")
+    g.add_argument(
+        "--lr-schedule",
+        choices=["cosine", "constant"],
+        default=LR_SCHEDULE,
+        help="after warmup: cosine decay to --min-lr at --max-iters, or keep --lr constant",
+    )
+    g.add_argument("--warmup-iters", type=int, default=WARMUP_ITERS, help="linear lr warmup steps")
+    g.add_argument("--min-lr", type=float, default=None, help="final lr of the cosine schedule; None means lr / 10")
     g.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="AdamW weight decay")
     g.add_argument("--seed", type=int, default=1337, help="random seed (ignored when resuming)")
     g.add_argument(
@@ -188,6 +200,18 @@ def load_checkpoint(model, optimizer):
     return checkpoint["step"]
 
 
+def get_lr(step):
+    # linear warmup, then cosine decay from LEARNING_RATE to MIN_LR at MAX_ITERS
+    if step < WARMUP_ITERS:
+        return LEARNING_RATE * (step + 1) / WARMUP_ITERS
+    if LR_SCHEDULE == "constant":
+        return LEARNING_RATE
+    if step >= MAX_ITERS:
+        return MIN_LR
+    progress = (step - WARMUP_ITERS) / max(1, MAX_ITERS - WARMUP_ITERS)
+    return MIN_LR + 0.5 * (LEARNING_RATE - MIN_LR) * (1 + math.cos(math.pi * progress))
+
+
 def sync():
     # wait for queued GPU work so wall-clock timings are accurate
     if device.type == "cuda":
@@ -212,6 +236,9 @@ if __name__ == "__main__":
     BATCH_SIZE = args.batch_size
     MAX_ITERS = args.max_iters
     LEARNING_RATE = args.lr
+    LR_SCHEDULE = args.lr_schedule
+    WARMUP_ITERS = args.warmup_iters
+    MIN_LR = args.min_lr if args.min_lr is not None else args.lr / 10
     WEIGHT_DECAY = args.weight_decay
     LOG_FREQ = args.log_freq
     CKPT_FREQ = args.ckpt_freq
@@ -253,6 +280,9 @@ if __name__ == "__main__":
     window_start = train_start
     try:
         for step in range(start_step, MAX_ITERS):
+            lr = get_lr(step)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             with ctx:
                 logits, loss = model(x, y)
             x, y = get_batch("train")
@@ -269,7 +299,7 @@ if __name__ == "__main__":
                 window_time = now - window_start
                 tok_per_sec = loss_steps * tokens_per_step / window_time
                 print(
-                    f"Step: {step}/{MAX_ITERS} loss {avg_loss:.3} | "
+                    f"Step: {step}/{MAX_ITERS} loss {avg_loss:.3} | lr {lr:.2e} | "
                     f"{window_time * 1000 / loss_steps:.1f} ms/step | "
                     f"{tok_per_sec:,.0f} tok/s | elapsed {now - train_start:.1f}s"
                 )
