@@ -64,7 +64,8 @@ python finetune.py --base CHECKPOINT [--data dolly alpaca my_qa.jsonl ...] [opti
 | `--val-fraction F` | 0.02 | Share of examples held out for validation |
 | `--epochs N` | 3 | Passes over the training examples; fractions are allowed |
 | `--max-iters N` | none | Total steps; overrides `--epochs` |
-| `--batch-size N` | 32 | Examples per step |
+| `--batch-size N` | 32 | Examples per optimizer step |
+| `--grad-accum N` | 1 | Split each step into N micro-batches, for less memory with the same examples per step. Micro-batches are weighted by their number of answer tokens, so the result matches one full batch |
 | `--block-size N` | base checkpoint's | Maximum tokens per example. Longer examples are truncated, and skipped if no answer tokens remain |
 | `--lr LR` | 1e-4 | Peak learning rate, about 10× lower than pretraining, so the model keeps what it learned |
 | `--min-lr LR` | `lr / 10` | Final learning rate of the cosine schedule |

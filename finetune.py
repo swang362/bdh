@@ -59,7 +59,13 @@ def parse_args():
     p.add_argument("--val-fraction", type=float, default=0.02, help="share of examples held out for validation")
     p.add_argument("--epochs", type=float, default=3, help="passes over the training examples")
     p.add_argument("--max-iters", type=int, default=None, help="total steps (overrides --epochs)")
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--batch-size", type=int, default=32, help="examples per optimizer step")
+    p.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="split each step into N micro-batches: same examples per step, less memory",
+    )
     p.add_argument("--block-size", type=int, default=None, help="max tokens per example (default: the base checkpoint's block size)")
     p.add_argument("--lr", type=float, default=1e-4, help="peak learning rate (lower than pretraining)")
     p.add_argument("--min-lr", type=float, default=None, help="final lr of the cosine schedule (default: lr / 10)")
@@ -162,6 +168,8 @@ def make_batch(examples, device):
 
 def main():
     args = parse_args()
+    if args.grad_accum < 1 or args.grad_accum > args.batch_size:
+        raise SystemExit("--grad-accum must be between 1 and --batch-size")
     use_cuda = torch.cuda.is_available() and not args.cpu
     device = torch.device("cuda" if use_cuda else "cpu")
     dtype = torch.bfloat16 if use_cuda and torch.cuda.is_bf16_supported() else torch.float16
@@ -249,8 +257,9 @@ def main():
         # loss per trained token over all validation examples, dropout off
         model.eval()
         total, count = 0.0, 0
-        for i in range(0, len(val_examples), args.batch_size):
-            x, y = make_batch(val_examples[i : i + args.batch_size], device)
+        eval_batch = max(1, args.batch_size // args.grad_accum)  # micro-batch size: fits in memory
+        for i in range(0, len(val_examples), eval_batch):
+            x, y = make_batch(val_examples[i : i + eval_batch], device)
             with ctx:
                 _, loss = model(x, y)
             n = (y != -100).sum().item()
@@ -284,13 +293,22 @@ def main():
             epoch, offset = divmod(step, steps_per_epoch)
             order = epoch_order(epoch)
             batch_ids = order[offset * args.batch_size : (offset + 1) * args.batch_size]
-            x, y = make_batch([train_examples[i] for i in batch_ids], device)
             lr = get_lr(step)
             for group in optimizer.param_groups:
                 group["lr"] = lr
-            with ctx:
-                _, loss = model(x, y)
-            scaler.scale(loss).backward()
+            # gradient accumulation: split the step's examples into micro-batches. Each
+            # micro-batch loss is a mean over its answer tokens, so weight it by its share
+            # of the step's answer tokens to get the same result as one full batch
+            micro = [batch_ids[i :: args.grad_accum] for i in range(args.grad_accum)]
+            batches = [make_batch([train_examples[i] for i in ids], device) for ids in micro if ids]
+            n_total = sum((y != -100).sum().item() for _, y in batches)
+            step_loss = 0.0
+            for x, y in batches:
+                with ctx:
+                    _, loss = model(x, y)
+                    loss = loss * ((y != -100).sum().item() / n_total)
+                scaler.scale(loss).backward()
+                step_loss += loss.item()
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -298,7 +316,7 @@ def main():
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             step += 1
-            loss_acc += loss.item()
+            loss_acc += step_loss
             loss_n += 1
             if step % args.log_freq == 0 or step == max_iters:
                 dt = time.perf_counter() - t0

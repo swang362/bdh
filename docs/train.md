@@ -23,7 +23,8 @@ With `--data-dir`, the tokenizer, vocab size and data type all come from the dat
 | Option | Default | Description |
 |---|---|---|
 | `--max-iters N` | 3000 | Total training steps. Also where the cosine schedule ends |
-| `--batch-size N` | 32 | Sequences per step |
+| `--batch-size N` | 32 | Sequences per optimizer step |
+| `--grad-accum N` | 1 | Split each step into N micro-batches of `batch-size / N` sequences. Tokens per step stay the same, activation memory drops about N×, and each step takes somewhat longer. `--batch-size` must be divisible by N |
 | `--block-size N` | 512 | Sequence length in tokens. Saved in the checkpoint and used by `inference.py` as its context window |
 | `--lr LR` | 1e-3 | Peak learning rate, reached at the end of warmup |
 | `--lr-schedule` | `cosine` | `cosine` decays to `--min-lr` by `--max-iters`; `constant` stays at `--lr` after warmup |
@@ -112,8 +113,11 @@ python train.py --max-iters 3000 --dropout 0.2 --ckpt-dir checkpoints/shakespear
 python train.py --data-dir data/tinystories_sp4096 --ckpt-dir checkpoints/ts_sp4096 \
     --max-iters 40000 --warmup-iters 1000 --dropout 0.0 --ckpt-freq 2000 --log-freq 200
 
-# Out of GPU memory: halve the batch size (tokens per step halve too)
-python train.py ... --batch-size 16
+# Out of GPU memory: split each step into micro-batches (tokens per step stay the same)
+python train.py ... --grad-accum 4
+
+# Larger model that needs gradient accumulation (32 sequences per step as 8 micro-batches of 4)
+python train.py ... --n-embd 1024 --lr 3e-4 --grad-accum 8
 
 # Longer context with the same tokens per step
 python train.py ... --block-size 1024 --batch-size 16
@@ -127,7 +131,8 @@ python train.py --lr-schedule constant --warmup-iters 0
 
 ## Tips
 
-- **Memory:** the main activation per layer has shape `batch × heads × block × N`. At the defaults that's 32 × 4 × 512 × 8192 = 537M values, about 1GB in bf16 for each such tensor. Lower `--batch-size` first.
+- **Memory:** the main activation per layer has shape `micro-batch × heads × block × N`. At the defaults that's 32 × 4 × 512 × 8192 = 537M values, about 1GB in bf16 for each such tensor. It grows in proportion to `--n-embd` and `--mlp-mult`: 2× at `--n-embd 512`, 4× at 1024. Use `--grad-accum` first, since lowering `--batch-size` would also change the tokens per step and the training behavior.
+- **Choosing `--grad-accum`:** use the smallest N that fits, because each extra micro-batch adds some overhead. Watch the GPU memory in the first few steps (e.g. with `nvidia-smi`), and double N if you run out of memory.
 - **How long to train:** a common rule of thumb is about 20 tokens per parameter, roughly 500M tokens for 25M parameters. Tokens per step are `batch-size × block-size`, 16,384 by default.
 - **Plateaus:** if the loss stops falling, check the learning rate first. A cosine decay to `--min-lr` usually gives a further drop near the end. Watch the validation loss: if it rises while training loss falls, stop, or use `best.pt`.
 - **Evaluation cost:** 50 validation batches every 500 steps adds roughly 3% to training time. The first evaluation also triggers a one-off `torch.compile` for evaluation mode.

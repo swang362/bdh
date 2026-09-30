@@ -46,6 +46,8 @@ print(f"Using device: {device} with dtype {dtype}")
 BDH_CONFIG = bdh.BDHConfig()
 BLOCK_SIZE = 512
 BATCH_SIZE = 32
+GRAD_ACCUM = 1  # micro-batches per optimizer step; each holds BATCH_SIZE // GRAD_ACCUM sequences
+MICRO_BATCH_SIZE = BATCH_SIZE // GRAD_ACCUM
 MAX_ITERS = 3000
 LEARNING_RATE = 1e-3
 LR_SCHEDULE = "cosine"  # "cosine" (decay to MIN_LR) or "constant"
@@ -79,7 +81,14 @@ def parse_args():
     )
     g = p.add_argument_group("training")
     g.add_argument("--max-iters", type=int, default=MAX_ITERS, help="total training steps")
-    g.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="sequences per step")
+    g.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="sequences per optimizer step")
+    g.add_argument(
+        "--grad-accum",
+        type=int,
+        default=GRAD_ACCUM,
+        help="split each step into N micro-batches of batch-size / N sequences: same tokens per step, "
+        "about N times less activation memory; batch-size must be divisible by N",
+    )
     g.add_argument("--block-size", type=int, default=BLOCK_SIZE, help="sequence length in tokens")
     g.add_argument("--lr", type=float, default=LEARNING_RATE, help="peak AdamW learning rate")
     g.add_argument(
@@ -164,7 +173,7 @@ def get_batch(split, generator=None):
             data = data[: int(0.9 * len(data))]
         else:
             data = data[int(0.9 * len(data)) :]
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,), generator=generator)
+    ix = torch.randint(len(data) - BLOCK_SIZE, (MICRO_BATCH_SIZE,), generator=generator)
     x = torch.stack(
         [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
     )
@@ -275,13 +284,15 @@ def evaluate(model):
     generator = torch.Generator().manual_seed(0)
     model.eval()
     total = 0.0
-    for _ in range(EVAL_ITERS):
+    # batches are micro-batches, so run GRAD_ACCUM times as many to cover the same tokens
+    n_batches = EVAL_ITERS * GRAD_ACCUM
+    for _ in range(n_batches):
         x, y = get_batch("val", generator=generator)
         with ctx:
             _, loss = model(x, y)
         total += loss.item()
     model.train()
-    return total / EVAL_ITERS
+    return total / n_batches
 
 
 if __name__ == "__main__":
@@ -314,6 +325,10 @@ if __name__ == "__main__":
     )
     BLOCK_SIZE = args.block_size
     BATCH_SIZE = args.batch_size
+    GRAD_ACCUM = args.grad_accum
+    if GRAD_ACCUM < 1 or BATCH_SIZE % GRAD_ACCUM != 0:
+        raise SystemExit(f"--batch-size {BATCH_SIZE} must be divisible by --grad-accum {GRAD_ACCUM}")
+    MICRO_BATCH_SIZE = BATCH_SIZE // GRAD_ACCUM
     MAX_ITERS = args.max_iters
     LEARNING_RATE = args.lr
     LR_SCHEDULE = args.lr_schedule
@@ -334,6 +349,11 @@ if __name__ == "__main__":
     raw_model = bdh.BDH(BDH_CONFIG).to(device)
     n_params = sum(p.numel() for p in raw_model.parameters())
     print(f"Model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
+    if GRAD_ACCUM > 1:
+        print(
+            f"Gradient accumulation: {GRAD_ACCUM} micro-batches of {MICRO_BATCH_SIZE} "
+            f"= {BATCH_SIZE} sequences ({BATCH_SIZE * BLOCK_SIZE:,} tokens) per step"
+        )
     optimizer = torch.optim.AdamW(
         raw_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
@@ -380,15 +400,20 @@ if __name__ == "__main__":
             lr = get_lr(step)
             for group in optimizer.param_groups:
                 group["lr"] = lr
-            with ctx:
-                logits, loss = model(x, y)
-            x, y = get_batch("train")
-            loss_acc += loss
+            # gradient accumulation: GRAD_ACCUM micro-batches add up their gradients,
+            # each loss scaled by 1/GRAD_ACCUM so the sum equals the full-batch mean
+            for _ in range(GRAD_ACCUM):
+                with ctx:
+                    logits, loss = model(x, y)
+                    loss = loss / GRAD_ACCUM
+                # fetch the next micro-batch while the GPU works on this one
+                x, y = get_batch("train")
+                loss_acc += loss.detach()
+                scaler.scale(loss).backward()
             loss_steps += 1
-            scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             completed_steps = step + 1
             if step % LOG_FREQ == 0:
                 avg_loss = loss_acc.item() / loss_steps  # .item() also syncs the GPU
