@@ -181,6 +181,7 @@ def save_checkpoint(model, optimizer, step):
         "scaler": scaler.state_dict(),
         "step": step,  # number of completed steps, i.e. the next step to run
         "config": dataclasses.asdict(BDH_CONFIG),
+        "block_size": BLOCK_SIZE,  # training context length, used by inference.py
         "tokenizer": tokenizers.to_state(TOKENIZER),
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],

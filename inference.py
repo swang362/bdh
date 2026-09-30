@@ -21,6 +21,13 @@ def parse_args():
     )
     parser.add_argument("--checkpoint", default=DEFAULT_CKPT_PATH)
     parser.add_argument("--max-new-tokens", type=int, default=200)
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=None,
+        help="max tokens fed to the model per step (default: the training block size "
+        "saved in the checkpoint; 0 means unlimited)",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--seed", type=int, default=None)
@@ -131,10 +138,14 @@ def print_resources(model, device, elapsed, cpu_time):
 
 
 @torch.no_grad()
-def generate_stream(model, idx, max_new_tokens, temperature=1.0, top_k=None):
+def generate_stream(model, idx, max_new_tokens, temperature=1.0, top_k=None, context_size=None):
     # same sampling as BDH.generate, but yields each new token as it is produced
     for _ in range(max_new_tokens):
-        logits, _ = model(idx)
+        # the attention sums over all previous tokens without normalization, so
+        # sequences longer than the training block size go out of distribution;
+        # feed only the most recent context_size tokens (a sliding window)
+        idx_cond = idx if context_size is None else idx[:, -context_size:]
+        logits, _ = model(idx_cond)
         logits = logits[:, -1, :] / temperature
         if top_k is not None:
             values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -173,9 +184,20 @@ def main():
     model.eval()
     # checkpoints from before tokenizer support have no entry and are byte-level
     tok = tokenizers.from_state(checkpoint.get("tokenizer"))
+    context_size = args.context_size
+    if context_size is None:
+        # checkpoints from before block_size was saved: assume train.py's default
+        context_size = checkpoint.get("block_size", 512)
+        if "block_size" not in checkpoint:
+            print(
+                "Checkpoint has no block_size; assuming 512 "
+                "(pass --context-size if you trained with a different --block-size)",
+                file=sys.stderr,
+            )
     print(
         f"Loaded {args.checkpoint} (step {checkpoint['step']}) on {device}, "
-        f"{tok.type} tokenizer (vocab {tok.vocab_size})",
+        f"{tok.type} tokenizer (vocab {tok.vocab_size}), "
+        f"context {context_size or 'unlimited'}",
         file=sys.stderr,
     )
 
@@ -214,6 +236,7 @@ def main():
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            context_size=context_size or None,
         ):
             if first_token_time is None:
                 first_token_time = time.perf_counter() - start
