@@ -18,7 +18,7 @@ For measured results, see [benchmarks.md](benchmarks.md).
 pip install -r requirements.txt
 ```
 
-`sentencepiece` is only needed for the SentencePiece tokenizer. `psutil` is optional: it enables the RAM line in `inference.py`'s resource report on Windows.
+`sentencepiece` is only needed for the SentencePiece tokenizer, and `pyarrow` only for the `wikipedia` and `fineweb-edu` datasets. `psutil` is optional: it enables the RAM line in `inference.py`'s resource report on Windows.
 
 ## Quick start
 
@@ -47,6 +47,17 @@ python inference.py "Once upon a time" --checkpoint checkpoints/ts_sp4096/latest
 python prepare_data.py tinystories --max-train-bytes 100_000_000 --name ts_100mb
 python train.py --data-dir data/ts_100mb --ckpt-dir checkpoints/ts_100mb --max-iters 5000
 ```
+
+**Knowledge-heavy text.** Wikipedia, 2 shards, 16K BPE vocabulary:
+
+```
+python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece --vocab-size 16384
+python train.py --data-dir data/wikipedia_2shards_sp16384 --ckpt-dir checkpoints/wiki_sp16384 \
+    --max-iters 40000 --warmup-iters 1000 --dropout 0.0 \
+    --prompt "The history of" --sample-tokens 300
+```
+
+Expect fluent but factually unreliable text, and a higher bits per byte than on TinyStories. See the tips in [prepare_data.md](prepare_data.md).
 
 ## Directory layout
 

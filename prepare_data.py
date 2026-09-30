@@ -13,11 +13,17 @@ Raw downloads are cached in <out-dir>/raw/<dataset>/, so preparing the same
 dataset with another tokenizer doesn't download it again. Files are streamed
 in chunks, so multi-GB datasets never need to fit in memory.
 
+Wikipedia and FineWeb-Edu are published as parquet shards on Hugging Face;
+--shards picks how many to download. Documents are joined into one text file,
+separated by <|endoftext|> lines (the same format as TinyStories).
+
 Examples:
     python prepare_data.py tinystories
     python prepare_data.py tinystories --tokenizer sentencepiece --vocab-size 4096
     python prepare_data.py tinystories --max-train-bytes 100_000_000
     python prepare_data.py shakespeare
+    python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece --vocab-size 16384
+    python prepare_data.py fineweb-edu --tokenizer sentencepiece --vocab-size 16384
     python prepare_data.py text --input my_corpus.txt --name my_corpus
 """
 
@@ -37,6 +43,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 SHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 TINYSTORIES_URL = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-{split}.txt"
+
+# parquet datasets on Hugging Face: repo, folder with the shards, and whether to
+# put the article title above the text
+HF_DATASETS = {
+    # English Wikipedia (2023-11-01 dump): 41 shards of about 330-420MB parquet each
+    "wikipedia": {"repo": "wikimedia/wikipedia", "path": "20231101.en", "title": True},
+    # FineWeb-Edu 10B-token sample: 14 shards of about 2.15GB parquet each
+    "fineweb-edu": {"repo": "HuggingFaceFW/fineweb-edu", "path": "sample/10BT", "title": False},
+}
+HF_VAL_FRACTION = 0.005  # these datasets are large, so hold out less by default
 
 
 def fmt_bytes(n):
@@ -236,9 +252,65 @@ def sources_text(args):
     return split_file(args.input, args.val_fraction)
 
 
+def list_hf_shards(repo, path):
+    """Parquet shard paths of a Hugging Face dataset folder, in order."""
+    url = f"https://huggingface.co/api/datasets/{repo}/tree/main/{path}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return sorted(
+        f["path"] for f in r.json() if f["type"] == "file" and f["path"].endswith(".parquet")
+    )
+
+
+def parquet_to_text(parquet_path, out, with_title):
+    """Append each document of a parquet shard to out, followed by an <|endoftext|> line."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        raise SystemExit("Reading parquet needs pyarrow: pip install pyarrow")
+    columns = ["title", "text"] if with_title else ["text"]
+    docs = 0
+    for batch in pq.ParquetFile(parquet_path).iter_batches(batch_size=1024, columns=columns):
+        texts = batch.column("text").to_pylist()
+        titles = batch.column("title").to_pylist() if with_title else [None] * len(texts)
+        for title, text in zip(titles, texts):
+            text = (text or "").strip()
+            if not text:
+                continue
+            doc = f"{title}\n\n{text}" if title else text
+            out.write(f"{doc}\n{EOT}\n".encode("utf-8"))
+            docs += 1
+    return docs
+
+
+def sources_hf(args):
+    spec = HF_DATASETS[args.dataset]
+    raw = os.path.join(args.out_dir, "raw", args.dataset)
+    shards = list_hf_shards(spec["repo"], spec["path"])
+    if args.shards < 1 or args.shards > len(shards):
+        raise SystemExit(f"--shards must be between 1 and {len(shards)} for {args.dataset}")
+    shards = shards[: args.shards]
+    # the joined text is cached per shard count; parquet shards are kept for reuse
+    text_path = os.path.join(raw, f"text_{len(shards)}shards.txt")
+    if not os.path.exists(text_path):
+        os.makedirs(raw, exist_ok=True)
+        tmp = text_path + ".part"
+        with open(tmp, "wb") as out:
+            for i, shard in enumerate(shards):
+                local = os.path.join(raw, os.path.basename(shard))
+                download(f"https://huggingface.co/datasets/{spec['repo']}/resolve/main/{shard}", local)
+                print(f"  converting shard {i + 1}/{len(shards)} to text...", end="", flush=True)
+                docs = parquet_to_text(local, out, spec["title"])
+                print(f" {docs:,} documents, {fmt_bytes(out.tell())} so far")
+        os.replace(tmp, text_path)
+    return split_file(text_path, args.val_fraction)
+
+
 DATASETS = {
     "tinystories": sources_tinystories,
     "shakespeare": sources_shakespeare,
+    "wikipedia": sources_hf,
+    "fineweb-edu": sources_hf,
     "text": sources_text,
 }
 
@@ -262,8 +334,16 @@ def parse_args():
     p.add_argument(
         "--val-fraction",
         type=float,
-        default=0.1,
-        help="fraction held out for validation (shakespeare/text only)",
+        default=None,
+        help=f"fraction held out for validation (not tinystories, which has its own split); "
+        f"default 0.1, or {HF_VAL_FRACTION} for wikipedia/fineweb-edu",
+    )
+    p.add_argument(
+        "--shards",
+        type=int,
+        default=1,
+        help="parquet shards to download (wikipedia: up to 41, about 330-420MB each; "
+        "fineweb-edu: up to 14, about 2.15GB each)",
     )
     p.add_argument(
         "--max-train-bytes",
@@ -293,6 +373,8 @@ def parse_args():
     args = p.parse_args()
     if args.dataset == "text" and not args.input:
         p.error("--input is required for the 'text' dataset")
+    if args.val_fraction is None:
+        args.val_fraction = HF_VAL_FRACTION if args.dataset in HF_DATASETS else 0.1
     return args
 
 
@@ -303,6 +385,8 @@ def main():
         if args.dataset == "text"
         else args.dataset
     )
+    if not args.name and args.dataset in HF_DATASETS and args.shards != 1:
+        name += f"_{args.shards}shards"
     if not args.name and args.tokenizer == "sentencepiece":
         name += f"_sp{args.vocab_size}" if not args.tokenizer_model else "_sp"
     out_dir = os.path.join(args.out_dir, name)
