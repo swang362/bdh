@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import math
 import os
+import shutil
 import time
 from contextlib import nullcontext
 
@@ -54,6 +55,7 @@ LOG_FREQ = 100
 CKPT_FREQ = 500  # save a checkpoint every CKPT_FREQ steps
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 CKPT_PATH = os.path.join(CKPT_DIR, "latest.pt")
+SNAPSHOT_FREQ = 5000  # keep a copy of the checkpoint every SNAPSHOT_FREQ steps (0 disables)
 RESUME = True  # resume from CKPT_PATH if it exists
 
 DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(__file__), "input.txt")
@@ -108,6 +110,12 @@ def parse_args():
     g.add_argument("--log-freq", type=int, default=LOG_FREQ, help="log every N steps")
     g.add_argument("--ckpt-freq", type=int, default=CKPT_FREQ, help="save a checkpoint every N steps")
     g.add_argument("--ckpt-dir", default=CKPT_DIR, help="checkpoint directory")
+    g.add_argument(
+        "--snapshot-freq",
+        type=int,
+        default=SNAPSHOT_FREQ,
+        help="every N steps (and at the end) also keep a copy named step<N>_loss<L>.pt; 0 disables",
+    )
     g.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
@@ -179,6 +187,14 @@ def save_checkpoint(model, optimizer, step):
     print(f"Saved checkpoint at step {step} to {CKPT_PATH}")
 
 
+def snapshot_checkpoint(step, loss):
+    # copy latest.pt to a permanent, descriptive name that later saves won't overwrite
+    name = f"step{step:07d}" + (f"_loss{loss:.4f}" if loss is not None else "") + ".pt"
+    path = os.path.join(CKPT_DIR, name)
+    shutil.copyfile(CKPT_PATH, path)
+    print(f"Saved snapshot {path}")
+
+
 def load_checkpoint(model, optimizer):
     checkpoint = torch.load(CKPT_PATH, map_location=device, weights_only=True)
     if checkpoint["config"] != dataclasses.asdict(BDH_CONFIG):
@@ -244,6 +260,7 @@ if __name__ == "__main__":
     CKPT_FREQ = args.ckpt_freq
     CKPT_DIR = args.ckpt_dir
     CKPT_PATH = os.path.join(CKPT_DIR, "latest.pt")
+    SNAPSHOT_FREQ = args.snapshot_freq
     RESUME = args.resume
     input_file_path = args.data
     data_dir = args.data_dir
@@ -273,11 +290,19 @@ if __name__ == "__main__":
 
     loss_acc = 0
     loss_steps = 0
+    avg_loss = None
     completed_steps = start_step
     tokens_per_step = BATCH_SIZE * BLOCK_SIZE
     sync()
     train_start = time.perf_counter()
     window_start = train_start
+
+    def recent_loss():
+        # average training loss since the last log line, or of the last log window
+        if loss_steps > 0:
+            return loss_acc.item() / loss_steps
+        return avg_loss
+
     try:
         for step in range(start_step, MAX_ITERS):
             lr = get_lr(step)
@@ -306,9 +331,14 @@ if __name__ == "__main__":
                 loss_acc = 0
                 loss_steps = 0
                 window_start = time.perf_counter()
-            if completed_steps % CKPT_FREQ == 0 and completed_steps < MAX_ITERS:
+            snapshot_due = SNAPSHOT_FREQ > 0 and completed_steps % SNAPSHOT_FREQ == 0
+            if (
+                completed_steps % CKPT_FREQ == 0 or snapshot_due
+            ) and completed_steps < MAX_ITERS:
                 save_start = time.perf_counter()
                 save_checkpoint(raw_model, optimizer, completed_steps)
+                if snapshot_due:
+                    snapshot_checkpoint(completed_steps, recent_loss())
                 # keep checkpoint I/O out of the throughput numbers
                 window_start += time.perf_counter() - save_start
     except KeyboardInterrupt:
@@ -325,6 +355,8 @@ if __name__ == "__main__":
             f"includes torch.compile warmup)"
         )
         save_checkpoint(raw_model, optimizer, completed_steps)
+        if SNAPSHOT_FREQ > 0:
+            snapshot_checkpoint(completed_steps, recent_loss())
     if args.sample_tokens > 0:
         print("Training done, now generating a sample ")
         model.eval()
