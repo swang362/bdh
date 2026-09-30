@@ -57,6 +57,10 @@ CKPT_FREQ = 500  # save a checkpoint every CKPT_FREQ steps
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 CKPT_PATH = os.path.join(CKPT_DIR, "latest.pt")
 SNAPSHOT_FREQ = 5000  # keep a copy of the checkpoint every SNAPSHOT_FREQ steps (0 disables)
+EVAL_FREQ = 500  # evaluate on the validation split every EVAL_FREQ steps (0 disables)
+EVAL_ITERS = 50  # validation batches averaged per evaluation
+BEST_PATH = os.path.join(CKPT_DIR, "best.pt")  # checkpoint with the lowest validation loss
+best_val_loss = float("inf")
 RESUME = True  # resume from CKPT_PATH if it exists
 
 DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(__file__), "input.txt")
@@ -126,6 +130,14 @@ def parse_args():
         default=RESUME,
         help="resume from <ckpt-dir>/latest.pt if it exists",
     )
+    g = p.add_argument_group("validation")
+    g.add_argument(
+        "--eval-freq",
+        type=int,
+        default=EVAL_FREQ,
+        help="evaluate on the validation split every N steps (and at the end), saving <ckpt-dir>/best.pt on improvement; 0 disables",
+    )
+    g.add_argument("--eval-iters", type=int, default=EVAL_ITERS, help="validation batches averaged per evaluation")
     g = p.add_argument_group("sample after training")
     g.add_argument("--prompt", default="To be or ", help="prompt for the sample generated after training")
     g.add_argument("--sample-tokens", type=int, default=100, help="number of tokens to generate (0 to skip sampling)")
@@ -142,7 +154,7 @@ def fetch_data():
             f.write(requests.get(data_url).text)
 
 
-def get_batch(split):
+def get_batch(split, generator=None):
     if data_dir is not None:
         data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=DATA_DTYPE, mode="r")
     else:
@@ -152,7 +164,7 @@ def get_batch(split):
             data = data[: int(0.9 * len(data))]
         else:
             data = data[int(0.9 * len(data)) :]
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,), generator=generator)
     x = torch.stack(
         [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
     )
@@ -172,8 +184,9 @@ def get_batch(split):
     return x, y
 
 
-def save_checkpoint(model, optimizer, step):
+def save_checkpoint(model, optimizer, step, path=None):
     # model must be the uncompiled module so state_dict keys have no "_orig_mod." prefix
+    path = path or CKPT_PATH
     os.makedirs(CKPT_DIR, exist_ok=True)
     checkpoint = {
         "model": model.state_dict(),
@@ -183,14 +196,15 @@ def save_checkpoint(model, optimizer, step):
         "config": dataclasses.asdict(BDH_CONFIG),
         "block_size": BLOCK_SIZE,  # training context length, used by inference.py
         "tokenizer": tokenizers.to_state(TOKENIZER),
+        "best_val_loss": best_val_loss,  # so a resumed run keeps improving on the same best
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
     }
     # write to a temp file first so an interrupted save never corrupts the last checkpoint
-    tmp_path = CKPT_PATH + ".tmp"
+    tmp_path = path + ".tmp"
     torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, CKPT_PATH)
-    print(f"Saved checkpoint at step {step} to {CKPT_PATH}")
+    os.replace(tmp_path, path)
+    print(f"Saved checkpoint at step {step} to {path}")
 
 
 def snapshot_checkpoint(step, loss):
@@ -205,6 +219,7 @@ def snapshot_checkpoint(step, loss):
 
 
 def load_checkpoint(model, optimizer):
+    global best_val_loss
     checkpoint = torch.load(CKPT_PATH, map_location=device, weights_only=True)
     # checkpoints from before tokenizer support have no entry and are byte-level
     ckpt_tokenizer = tokenizers.from_state(checkpoint.get("tokenizer"))
@@ -229,6 +244,7 @@ def load_checkpoint(model, optimizer):
     torch.set_rng_state(checkpoint["rng_cpu"].cpu())
     if torch.cuda.is_available() and checkpoint["rng_cuda"]:
         torch.cuda.set_rng_state_all([s.cpu() for s in checkpoint["rng_cuda"]])
+    best_val_loss = checkpoint.get("best_val_loss", float("inf"))
     print(f"Resumed from checkpoint {CKPT_PATH} at step {checkpoint['step']}")
     return checkpoint["step"]
 
@@ -251,8 +267,21 @@ def sync():
         torch.cuda.synchronize()
 
 
-def eval(model):
+@torch.no_grad()
+def evaluate(model):
+    """Average loss over EVAL_ITERS validation batches, with dropout off."""
+    # a fixed seed gives the same validation batches every time, so evaluations are
+    # comparable with each other, and the training RNG stream is left untouched
+    generator = torch.Generator().manual_seed(0)
     model.eval()
+    total = 0.0
+    for _ in range(EVAL_ITERS):
+        x, y = get_batch("val", generator=generator)
+        with ctx:
+            _, loss = model(x, y)
+        total += loss.item()
+    model.train()
+    return total / EVAL_ITERS
 
 
 if __name__ == "__main__":
@@ -296,6 +325,9 @@ if __name__ == "__main__":
     CKPT_DIR = args.ckpt_dir
     CKPT_PATH = os.path.join(CKPT_DIR, "latest.pt")
     SNAPSHOT_FREQ = args.snapshot_freq
+    EVAL_FREQ = args.eval_freq
+    EVAL_ITERS = args.eval_iters
+    BEST_PATH = os.path.join(CKPT_DIR, "best.pt")
     RESUME = args.resume
     torch.manual_seed(args.seed)
 
@@ -327,6 +359,22 @@ if __name__ == "__main__":
             return loss_acc.item() / loss_steps
         return avg_loss
 
+    def run_eval(step):
+        # evaluate on the validation split; keep best.pt at the lowest validation loss
+        global best_val_loss
+        val_loss = evaluate(model)
+        val_bpb = val_loss / math.log(2) / BYTES_PER_TOKEN
+        improved = val_loss < best_val_loss
+        if improved:
+            best_val_loss = val_loss
+        best_bpb = best_val_loss / math.log(2) / BYTES_PER_TOKEN
+        print(
+            f"Eval step {step}: val loss {val_loss:.4f} ({val_bpb:.4f} bpb) | "
+            + ("new best" if improved else f"best {best_val_loss:.4f} ({best_bpb:.4f} bpb)")
+        )
+        if improved:
+            save_checkpoint(raw_model, optimizer, step, BEST_PATH)
+
     try:
         for step in range(start_step, MAX_ITERS):
             lr = get_lr(step)
@@ -357,6 +405,11 @@ if __name__ == "__main__":
                 loss_acc = 0
                 loss_steps = 0
                 window_start = time.perf_counter()
+            if EVAL_FREQ > 0 and completed_steps % EVAL_FREQ == 0:
+                eval_start = time.perf_counter()
+                run_eval(completed_steps)
+                # keep evaluation out of the throughput numbers
+                window_start += time.perf_counter() - eval_start
             snapshot_due = SNAPSHOT_FREQ > 0 and completed_steps % SNAPSHOT_FREQ == 0
             if (
                 completed_steps % CKPT_FREQ == 0 or snapshot_due
@@ -380,6 +433,8 @@ if __name__ == "__main__":
             f"({trained_steps * tokens_per_step / train_time:,.0f} tok/s avg, "
             f"includes torch.compile warmup)"
         )
+        if EVAL_FREQ > 0 and completed_steps % EVAL_FREQ != 0:
+            run_eval(completed_steps)  # final evaluation, unless the last step just had one
         save_checkpoint(raw_model, optimizer, completed_steps)
         if SNAPSHOT_FREQ > 0:
             snapshot_checkpoint(completed_steps, recent_loss())

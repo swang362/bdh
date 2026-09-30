@@ -70,6 +70,7 @@ data/
     tokenizer.model         sentencepiece datasets only
 checkpoints/
   latest.pt                 most recent checkpoint, used for resuming
+  best.pt                   lowest validation loss so far
   step0005000_bpb0.5123.pt  snapshots kept every --snapshot-freq steps (named by training bits per byte)
 ```
 

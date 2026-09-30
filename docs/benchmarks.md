@@ -84,7 +84,7 @@ The README reports that BDH matches GPT-2 at *equal parameter counts*. Parameter
 ## Limitations
 
 - **One sample per model.** Quality differences between single samples are anecdotal.
-- **No validation loss.** `train.py` doesn't evaluate on validation data yet. Training loss, which is logged as bits per byte, is the only numeric comparison available.
+- **No validation loss.** These runs were made before `train.py` evaluated on validation data, so training loss, logged as bits per byte, is the only numeric comparison available. Runs made now log validation bpb every `--eval-freq` steps.
 - **Unequal budgets.** The runs differ in both steps and wall-clock time; the comparison is roughly at equal text seen.
 - **No GPT baseline.** The GPT compute figures are estimates, not measurements.
 - **Slow generation for both models.** It's limited by launching GPU operations (one CPU core at 100%), and it re-processes the full 512-token context for every new token. The attention has no softmax, so it could run as a recurrent state instead, which would make each token cost the same regardless of context length. That isn't implemented yet.

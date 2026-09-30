@@ -57,6 +57,13 @@ The parameter count is about `3 × 128 × D² + 2 × vocab × D` at the default 
 | `--snapshot-freq N` | 5000 | Every N steps, and at the end, also keep a copy named `step<N>_bpb<B>.pt`, where B is the recent training bits per byte. `0` turns this off |
 | `--resume` / `--no-resume` | on | Resume from `<ckpt-dir>/latest.pt` if it exists |
 
+### Validation
+
+| Option | Default | Description |
+|---|---|---|
+| `--eval-freq N` | 500 | Evaluate on the validation split every N steps and at the end. Saves `<ckpt-dir>/best.pt` whenever validation loss improves. `0` turns this off |
+| `--eval-iters N` | 50 | Validation batches averaged per evaluation. With the defaults that's 50 × 32 × 512 = about 820K tokens |
+
 ### Sample after training
 
 | Option | Default | Description |
@@ -73,11 +80,23 @@ Step: 2000/40000 loss 1.62 (2.34 bpb) | lr 9.98e-04 | 142.3 ms/step | 115,130 to
 - **loss:** training cross-entropy per token, averaged since the previous log line. Dropout is on during training, so it reads slightly high.
 - **bpb:** the same loss in bits per byte of text. Use it to compare runs with different tokenizers.
 - **lr:** the learning rate at this step.
-- **ms/step and tok/s:** throughput. The first window includes `torch.compile` warmup, and checkpoint saving isn't counted.
+- **ms/step and tok/s:** throughput. The first window includes `torch.compile` warmup. Checkpoint saving and evaluation aren't counted.
+
+Every `--eval-freq` steps, a validation line follows:
+
+```
+Eval step 2000: val loss 1.6543 (2.3867 bpb) | new best
+Eval step 2500: val loss 1.6601 (2.3951 bpb) | best 1.6543 (2.3867 bpb)
+```
+
+- **val loss and bpb:** measured on the validation split with dropout off, so they're the numbers to compare runs by.
+- **The same batches each time:** every evaluation uses the same validation batches (a fixed seed), so changes between evaluations reflect the model, not which batches were drawn.
+- **Overfitting:** training loss still falling while validation loss rises means the model is memorizing. That's common on Tiny Shakespeare.
 
 ## Checkpoints, resuming and snapshots
 
-- **What a checkpoint contains:** the weights, optimizer and gradient-scaler state, the step, the model config, the tokenizer, `block_size` and the random-number state. Every save writes a temp file first, so an interrupted save can't corrupt `latest.pt`.
+- **What a checkpoint contains:** the weights, optimizer and gradient-scaler state, the step, the model config, the tokenizer, `block_size`, the best validation loss so far and the random-number state. Every save writes a temp file first, so an interrupted save can't corrupt `latest.pt`.
+- **`best.pt`** is the checkpoint with the lowest validation loss so far, saved at evaluation time. It's usually the one to use with `inference.py --checkpoint`, especially if later training overfits. A resumed run remembers the best validation loss, so `best.pt` is only replaced by something better.
 - **Ctrl+C** saves `latest.pt` before exiting. Run the same command again to continue.
 - **What resuming requires:** the same model options (`--n-layer`, `--n-embd`, `--n-head`, `--dropout`, `--mlp-mult`) and the same tokenizer. Otherwise it stops with an error; use a new `--ckpt-dir` or `--no-resume`.
 - **Options you can change when resuming:** `--lr`, `--min-lr`, `--weight-decay`, `--batch-size`, `--block-size` and `--max-iters`. The learning rate is recomputed from the step number. Changing `--max-iters` reshapes the rest of the schedule, and the rate can jump back up.
@@ -110,4 +129,5 @@ python train.py --lr-schedule constant --warmup-iters 0
 
 - **Memory:** the main activation per layer has shape `batch × heads × block × N`. At the defaults that's 32 × 4 × 512 × 8192 = 537M values, about 1GB in bf16 for each such tensor. Lower `--batch-size` first.
 - **How long to train:** a common rule of thumb is about 20 tokens per parameter, roughly 500M tokens for 25M parameters. Tokens per step are `batch-size × block-size`, 16,384 by default.
-- **Plateaus:** if the loss stops falling, check the learning rate first. A cosine decay to `--min-lr` usually gives a further drop near the end. On small datasets like Tiny Shakespeare, a low training loss often means memorization.
+- **Plateaus:** if the loss stops falling, check the learning rate first. A cosine decay to `--min-lr` usually gives a further drop near the end. Watch the validation loss: if it rises while training loss falls, stop, or use `best.pt`.
+- **Evaluation cost:** 50 validation batches every 500 steps adds roughly 3% to training time. The first evaluation also triggers a one-off `torch.compile` for evaluation mode.
