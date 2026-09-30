@@ -12,12 +12,14 @@ The checkpoint provides the model config, the tokenizer and the training block s
 
 | Option | Default | Description |
 |---|---|---|
-| `prompt` | required | Text to continue. It can contain `<|endoftext|>`, which is a single token with SentencePiece |
+| `prompt` | required, unless `--load-state` is given | Text to continue. It can contain `<|endoftext|>`, which is a single token with SentencePiece |
 | `--checkpoint FILE` | `checkpoints/latest.pt` | Checkpoint or snapshot to load |
 | `--max-new-tokens N` | 200 | Maximum tokens to generate |
 | `--context-size N` | training block size from the checkpoint | How many recent tokens the model sees at each step. `0` means unlimited (not recommended, see below) |
 | `--recurrent` | off | Generate with a fixed-size recurrent state instead of re-reading the context for every token. Much less compute per token, and constant speed however long the output. Identical output while prompt plus output fit in the context window. See [recurrent.md](recurrent.md) |
 | `--cuda-graph` | off | With `--recurrent` on CUDA: record each token step as a CUDA graph and replay it with one launch, removing most of the per-token launch overhead. Falls back automatically if recording fails. See [recurrent.md](recurrent.md#cuda-graphs---cuda-graph) |
+| `--save-state FILE` | none | With `--recurrent`: after generating, save the state, including everything generated, to continue later |
+| `--load-state FILE` | none | With `--recurrent`: start from a saved state. The prompt is read after it, and may be empty (`""`) to continue straight on. Only the same checkpoint and `--context-size` can load a file |
 | `--temperature T` | 1.0 | Sampling temperature; lower is more predictable. Must be above 0 |
 | `--top-k K` | 3 | Only sample from the K most likely tokens. `--top-k 1` always picks the most likely token (greedy) |
 | `--seed N` | none | Makes the output reproducible |
@@ -35,6 +37,8 @@ python inference.py "ROMEO:" --max-new-tokens 500 --temperature 0.8 --top-k 10 -
 python inference.py "Once upon a time" --top-k 1          # greedy
 python inference.py "The end.<|endoftext|>" --max-new-tokens 300   # start a fresh story
 python inference.py "Once upon a time" --cpu --no-resources
+python inference.py "Once upon a time" --recurrent --save-state story.pt          # write the start of a story
+python inference.py "" --recurrent --load-state story.pt --save-state story.pt    # continue it, then save again
 python inference.py "Once upon a time" > story.txt        # the file gets only the generated text
 ```
 

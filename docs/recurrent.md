@@ -131,10 +131,52 @@ They **combine**: compile the step to get fewer, fused kernels, then graph it. A
 | Script | Typical length | Benefit |
 |---|---|---|
 | `inference.py` | 200–1,000+ tokens | **High:** constant speed however long the output |
-| `chat.py` | multi-turn conversations, often past 512 tokens | **High:** faster replies in long conversations |
+| `chat.py` | multi-turn conversations, often past 512 tokens | **High:** each turn reads only the new question, replies are faster, and conversations can be saved and resumed |
 | `probe.py` | about 25 tokens (short prompt plus 10) | **Negligible.** Everything fits in the window, so scores are identical. There's hardly any context to re-read, so speed barely changes. Mainly useful as a check: probe scores with and without `--recurrent` should match. |
 
-In `chat.py`, each reply prepares the state from the whole conversation again. One window's worth is processed in one parallel pass, and anything beyond it token by token. The state object itself, with its buffers and any recorded CUDA graph, is kept for the whole session. Carrying the *contents* of the state from one turn to the next is a possible future improvement.
+In `chat.py` with conversation history, the conversation **stays in the state from turn to turn**, and each turn reads only the new question (see the next section). With `--no-history`, each question is read from scratch.
+
+## Saving and loading the state
+
+```
+python chat.py --recurrent --cuda-graph --state session.pt                  # resume session.pt, save on exit
+python inference.py "Once upon a time" --recurrent --save-state story.pt
+python inference.py "" --recurrent --load-state story.pt --save-state story.pt   # continue the story
+```
+
+### What's saved
+
+`RecurrentBDH.save(path)` writes everything the model remembers:
+- **The synapse state S** of every layer.
+- **The sliding-window ring buffer**, needed to subtract old tokens later.
+- **The position, the ring slot, the token ids read so far, and the logits for the next token.**
+- **A fingerprint of the model:** its config, plus a checksum of three weight matrices.
+- **Any extra data,** e.g. `chat.py` stores the message history and system prompt.
+
+`load(path)` copies it back into the existing tensors, in place, so a recorded CUDA graph stays valid. It **refuses** a file from a different model (config or weights differ) or a different window size, with a message saying why. Files are written to a temporary name first, so an interrupted save never corrupts an existing file.
+
+| Model | File size (default window) |
+|---|---|
+| D=256 (default) | about 0.6GB |
+| D=512 | about 1.6GB |
+| D=1024 | about 4.8GB |
+
+The size is the same after 10 tokens or 10 million: the state doesn't grow. With `--context-size 0` (unlimited), there's no ring buffer, so files are about a third of that.
+
+### How chat keeps the conversation in the state
+
+Each turn, `chat.py`:
+1. Reads only the **new tokens**: the user header, the question and the assistant header. It doesn't re-read the conversation.
+2. Takes an in-memory **snapshot**, then generates the reply.
+3. **Stores the reply exactly as the rendered conversation would tokenize it:** the answer text, `<|endoftext|>` and the turn separator. The tokens generated are usually already the start of that, so only the remainder is read. If they aren't (a different but equivalent tokenization, or the start of a stop string was read), it restores the snapshot and reads the canonical version instead.
+
+So the state always equals what re-reading the whole conversation would produce. Replies are the same as without the saved state, within the context window, just without the re-reading. The snapshot is a temporary copy of the state (about 0.6GB for the default model) on the GPU.
+
+### What a saved state remembers, and what it doesn't
+
+**With the sliding window,** the state only holds the **last `window − 1` tokens**, e.g. 511, about 1,800–2,000 characters with SentencePiece. Anything older has already been subtracted. So a saved state is an exact **session checkpoint**: pause, and continue later as if nothing happened. **It isn't a way to memorize a long document:** reading a whole manual and saving the state keeps only its last page or so.
+
+**With `--context-size 0`** (unlimited), everything read contributes to the state, in the same fixed size. But the model was only trained to use up to its block size of context, so past that it degrades. Using a saved state as real long-term memory would need a model **trained on much longer sequences**. The architecture allows it; the current checkpoints don't.
 
 ## Checking it: test_recurrent.py
 
@@ -148,7 +190,10 @@ It checks:
 2. Parallel prefill followed by steps gives the same logits as the forward pass.
 3. With a sliding window, results are identical while everything fits in it.
 4. Past the window, step-by-step and prefill-plus-steps both match a slow, independent reference. The reference keeps every token in a plain list and explicitly sums the last `window − 1` of them, which checks the ring buffer.
-5. With a CUDA GPU: CUDA graph replay matches the reference, also after a reset reuses the same recorded graph. With a GPU, the small random model is tested on both the CPU and the GPU.
+5. With a CUDA GPU: CUDA graph replay matches the reference, also after a reset reuses the same recorded graph, and after loading a saved state into it. With a GPU, the small random model is tested on both the CPU and the GPU.
+6. Saving, loading into a new state and continuing gives the same logits as continuing without saving, and the extra data round-trips.
+7. Restoring a snapshot and repeating a step gives the same logits.
+8. Loading is refused for a different model (same config, different weights) and for a different window size.
 
 Each check prints the largest difference relative to the largest logit. Anything below 1e-3 passes; float32 rounding typically gives about 1e-6. The script exits with an error code if any check fails.
 
@@ -156,8 +201,8 @@ Each check prints the largest difference relative to the largest logit. Anything
 
 - **Batch size 1:** one sequence at a time, which is what generation uses.
 - **Training still uses the parallel form.** Recurrent mode is for inference. Training on long streams with the state is related to the paper's Section 7.2 (training without backpropagation through time), which isn't implemented.
-- **Saving and loading the state** isn't implemented yet. It would let you save a session and resume it exactly. With the sliding window, the state only holds the last `window − 1` tokens, so it's a session checkpoint, not a memory of a whole long document.
-- **Carrying state contents across `chat.py` turns** isn't implemented yet, as described above.
+- **Saved states aren't long-term memory** with the current checkpoints; see "What a saved state remembers" above.
+- **Saved files are only as portable as the checkpoint:** they belong to one checkpoint and one context size. A retrained or fine-tuned checkpoint can't load an older state.
 - **Sampling runs outside the CUDA graph,** as does the `.item()` that sends each token back to Python for printing. Both add a small cost per token.
 - **`torch.compile` of the step** (fused kernels) isn't implemented; see the comparison above.
 - **Rounding drift:** the sliding window adds and later subtracts each token's term. In float32 that drift is negligible, even over very long streams.

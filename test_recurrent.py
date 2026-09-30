@@ -15,6 +15,8 @@ With a CUDA GPU it also checks CUDA graph replay (recurrent.py, cuda_graph=True)
 """
 
 import argparse
+import os
+import tempfile
 
 import torch
 
@@ -89,7 +91,54 @@ def run_checks(model, T, window, device):
             rest = torch.stack([rec.step(t) for t in long_ids[w:]])
             got = torch.cat([first[None], rest])
             ok &= check("CUDA graph reused after reset", rel_diff(got, expected[w - 1 :]))
+            # loading a saved state into a graphed state keeps the graph valid
+            src = RecurrentBDH(model, window=w)
+            src.prefill(long_ids[:w])
+            path = os.path.join(tempfile.mkdtemp(), "state.pt")
+            src.save(path)
+            rec.load(path)
+            got = torch.stack([rec.step(t) for t in long_ids[w:]])
+            ok &= check("CUDA graph after load", rel_diff(got, expected[w:]))
+
+    # 6. save and load: continuing a loaded state equals continuing without saving
+    rec = RecurrentBDH(model, window=w)
+    rec.prefill(long_ids[:w])
+    for t in long_ids[w : 2 * w]:
+        rec.step(t)
+    path = os.path.join(tempfile.mkdtemp(), "state.pt")
+    rec.save(path, extra={"note": "test"})
+    loaded = RecurrentBDH(model, window=w)
+    extra = loaded.load(path)
+    a = torch.stack([rec.step(t) for t in long_ids[2 * w :]])
+    b = torch.stack([loaded.step(t) for t in long_ids[2 * w :]])
+    ok &= check("save + load, then continue", rel_diff(b, a))
+    ok &= check("  ... and vs reference", rel_diff(b, expected[2 * w :]))
+    ok &= report("save stores extra data", extra == {"note": "test"})
+
+    # 7. snapshot and restore: stepping from a restored snapshot repeats exactly
+    snap = rec.snapshot()
+    first = rec.step(long_ids[0])
+    rec.restore(snap)
+    ok &= check("snapshot + restore", rel_diff(rec.step(long_ids[0]), first))
+
+    # 8. a state can't be loaded into a different model or window size
+    other = bdh.BDH(model.config).to(device).eval()  # same config, different random weights
+    ok &= report("load rejects a different model", raises(ValueError, RecurrentBDH(other, window=w).load, path))
+    ok &= report("load rejects a different window", raises(ValueError, RecurrentBDH(model, window=w + 1).load, path))
     return ok
+
+
+def report(name, ok):
+    print(f"  [{'OK' if ok else 'FAIL'}] {name}")
+    return ok
+
+
+def raises(error, fn, *args):
+    try:
+        fn(*args)
+    except error:
+        return True
+    return False
 
 
 @torch.no_grad()

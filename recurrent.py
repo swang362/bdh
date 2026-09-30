@@ -29,14 +29,24 @@ operations, and launching them from Python costs more than running them. The
 whole step is recorded once as a CUDA graph and then replayed with one launch.
 All state lives in fixed, preallocated tensors (zeroed in place by reset), so
 the recorded graph stays valid across prompts and chat turns.
+
+Saving and loading (save / load): the state can be written to a file and read
+back later to continue exactly where it stopped. The file records a fingerprint
+of the model (config and a checksum of the weights), so a state can't be loaded
+into a different model. With the sliding window, the state holds only the last
+window - 1 tokens: it's a session checkpoint, not a memory of a whole document.
 """
 
+import dataclasses
+import os
 import sys
 
 import torch
 import torch.nn.functional as F
 
 from bdh import Attention
+
+STATE_FORMAT = "bdh-recurrent-state-v1"
 
 
 def sample_next(logits, temperature=1.0, top_k=None):
@@ -82,6 +92,7 @@ class RecurrentBDH:
         self.token_t = torch.zeros(1, dtype=torch.long, device=self.device)  # input of the next step
         self.pos = 0
         self.ids = []
+        self.last_logits = None  # logits for the token after everything fed so far
 
         self.cuda_graph = cuda_graph and self.device.type == "cuda"
         if cuda_graph and not self.cuda_graph:
@@ -97,6 +108,11 @@ class RecurrentBDH:
         self.slot_t.zero_()
         self.pos = 0
         self.ids = []
+        self.last_logits = None
+
+    @property
+    def window(self):
+        return None if self.capacity is None else self.capacity + 1
 
     def state_bytes(self):
         """Memory used by the state and the ring buffer."""
@@ -104,6 +120,86 @@ class RecurrentBDH:
 
     def _state_tensors(self):
         return self.S + self.ring_q + self.ring_v + [self.pos_t, self.slot_t]
+
+    # ------------------------------------------------------------ snapshots and files
+
+    def snapshot(self):
+        """An in-memory copy of the state (on the same device), for restore()."""
+        return {
+            "tensors": [t.clone() for t in self._state_tensors()],
+            "pos": self.pos,
+            "ids": list(self.ids),
+            "last_logits": None if self.last_logits is None else self.last_logits.clone(),
+        }
+
+    def restore(self, snap):
+        """Go back to a snapshot(), copying in place (a recorded CUDA graph stays valid)."""
+        for t, s in zip(self._state_tensors(), snap["tensors"]):
+            t.copy_(s)
+        self.pos = snap["pos"]
+        self.ids = list(snap["ids"])
+        self.last_logits = snap["last_logits"]
+
+    def fingerprint(self):
+        """Identifies the model a state belongs to: its config and a checksum of the weights."""
+        m = self.model
+        return {
+            "config": dataclasses.asdict(m.config),
+            "weights_checksum": [
+                float(m.lm_head.detach().double().sum()),
+                float(m.embed.weight.detach().double().abs().sum()),
+                float(m.encoder.detach().double().abs().sum()),
+            ],
+        }
+
+    def save(self, path, extra=None):
+        """Write the state to path. extra: a dict of plain data (e.g. chat history) to store with it."""
+        state = {
+            "format": STATE_FORMAT,
+            **self.fingerprint(),
+            "window": self.window,
+            "pos": self.pos,
+            "slot": int(self.slot_t.item()),
+            "ids": list(self.ids),
+            "S": [t.cpu() for t in self.S],
+            "ring_q": [t.cpu() for t in self.ring_q],
+            "ring_v": [t.cpu() for t in self.ring_v],
+            "last_logits": None if self.last_logits is None else self.last_logits.float().cpu(),
+            "extra": extra or {},
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        # write to a temp file first so an interrupted save never corrupts an existing state
+        torch.save(state, path + ".tmp")
+        os.replace(path + ".tmp", path)
+
+    def load(self, path):
+        """Read a state written by save(); returns its extra dict.
+
+        Raises ValueError if the file belongs to a different model or window size.
+        """
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if state.get("format") != STATE_FORMAT:
+            raise ValueError(f"{path} is not a BDH recurrent state file")
+        mine = self.fingerprint()
+        same_weights = all(
+            abs(a - b) <= 1e-8 * max(1.0, abs(b)) for a, b in zip(state["weights_checksum"], mine["weights_checksum"])
+        )
+        if state["config"] != mine["config"] or not same_weights:
+            raise ValueError(f"{path} was saved with a different model (config or weights differ)")
+        if state["window"] != self.window:
+            raise ValueError(
+                f"{path} was saved with context window {state['window'] or 'unlimited'}, "
+                f"but this run uses {self.window or 'unlimited'}; pass --context-size {state['window'] or 0}"
+            )
+        for t, s in zip(self.S + self.ring_q + self.ring_v, state["S"] + state["ring_q"] + state["ring_v"]):
+            t.copy_(s)
+        self.pos = state["pos"]
+        self.pos_t.fill_(self.pos)
+        self.slot_t.fill_(state["slot"])
+        self.ids = list(state["ids"])
+        last = state["last_logits"]
+        self.last_logits = None if last is None else last.to(self.device)
+        return state["extra"]
 
     def _phases(self):
         if self.phases_on_device:
@@ -188,6 +284,15 @@ class RecurrentBDH:
             logits = self._step_body()
         self.pos += 1
         self.ids.append(token)
+        self.last_logits = logits
+        return logits
+
+    @torch.no_grad()
+    def feed(self, ids):
+        """Feed tokens after everything so far (no reset); returns the logits after the last one."""
+        logits = self.last_logits
+        for token in ids:
+            logits = self.step(token)
         return logits
 
     @torch.no_grad()
@@ -233,20 +338,29 @@ class RecurrentBDH:
         if self.capacity:
             self.slot_t.fill_(keep % self.capacity)
         self.ids = list(ids)
-        return x[0, 0, -1] @ m.lm_head
+        self.last_logits = x[0, 0, -1] @ m.lm_head
+        return self.last_logits
 
 
 @torch.no_grad()
 def generate_stream_recurrent(
-    model, ids, max_new_tokens, temperature=1.0, top_k=None, context_size=None, state=None, cuda_graph=False
+    model, ids, max_new_tokens, temperature=1.0, top_k=None, context_size=None, state=None, cuda_graph=False,
+    resume=False,
 ):
     """Like inference.generate_stream, but recurrent. ids is a list of prompt token ids.
 
     context_size is the sliding window (None: unlimited). Pass a RecurrentBDH as
-    state to reuse it, including a recorded CUDA graph; it is reset first.
+    state to reuse it, including a recorded CUDA graph. It is reset first, unless
+    resume=True: then ids are fed after what the state already holds (ids may be
+    empty to continue straight from it, e.g. after load()).
+
+    Each yielded token is fed into the state only when the next one is requested,
+    so if the caller stops early, the last yielded token is not in the state.
     """
     rec = state if state is not None else RecurrentBDH(model, window=context_size, cuda_graph=cuda_graph)
-    logits = rec.prefill(ids)
+    logits = rec.feed(ids) if resume else rec.prefill(ids)
+    if logits is None:
+        raise ValueError("nothing to continue from: the state is empty and no tokens were given")
     for i in range(max_new_tokens):
         token = sample_next(logits.float().unsqueeze(0), temperature, top_k).item()
         yield token

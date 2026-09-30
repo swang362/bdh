@@ -98,8 +98,8 @@ The numbers above are illustrative. The loss is per answer token: prompt tokens 
 python chat.py [question] [--checkpoint FILE] [options]
 ```
 
-- **Without a question:** an interactive session that remembers the conversation. `/reset` clears it, and `/exit` or Ctrl+D quits.
-- **With a question:** answers once and exits, e.g. for scripts: `python chat.py "What is DNA?"`.
+- **Without a question:** an interactive session that remembers the conversation. `/reset` clears it, and `/exit` or Ctrl+D quits. With `--recurrent`, `/save FILE` and `/load FILE` store and restore the conversation too (see below).
+- **With a question:** answers once and exits, e.g. for scripts: `python chat.py "What is DNA?"`. With `--recurrent --state FILE`, the question continues the conversation saved in FILE, and the updated conversation is saved back. So a multi-turn conversation can run across separate calls.
 - **Streaming:** replies stream as they're generated, and stop at `<|endoftext|>` or when the model starts a new `### User:` turn by itself.
 
 | Option | Default | Description |
@@ -111,12 +111,28 @@ python chat.py [question] [--checkpoint FILE] [options]
 | `--top-k K` | 20 | Sample from the K most likely tokens. `--top-k 1` is greedy, best for factual questions |
 | `--context-size N` | checkpoint's block size | Context window. Long conversations keep only the most recent tokens |
 | `--no-history` | off | Answer each question independently |
-| `--recurrent` | off | Generate with a fixed-size recurrent state: faster, especially in long conversations. Same replies while the conversation fits in the context window. See [recurrent.md](recurrent.md) |
+| `--recurrent` | off | Generate with a fixed-size recurrent state. With history, the conversation stays in the state and **only each new question is read**, instead of the whole conversation every turn. Same replies while the conversation fits in the context window. See [recurrent.md](recurrent.md) |
 | `--cuda-graph` | off | With `--recurrent` on CUDA: replay each token step as a recorded CUDA graph, for faster replies. Recorded once, on the first reply, and reused for the whole session |
+| `--state FILE` | none | With `--recurrent`: continue the conversation saved in FILE if it exists, and save it there on exit. It's also the default file for `/save` and `/load` |
 | `--seed N` | none | Reproducible sampling |
 | `--cpu` | off | Run on the CPU |
 
 A checkpoint that wasn't fine-tuned still loads, with a warning that replies will be plain text continuation.
+
+### Saving and resuming conversations (`--recurrent`)
+
+```
+python chat.py --recurrent --cuda-graph --state session.pt      # resumes session.pt if it exists, saves on exit
+You: /save before-experiment.pt                                  # during a session
+You: /load before-experiment.pt
+python chat.py "And its population?" --recurrent --state session.pt   # one more turn, then saved again
+```
+
+- **What a saved file holds:** the model's recurrent state (the conversation as the model has read it) plus the message history. After loading, the next question continues exactly where the conversation stopped, without re-reading anything.
+- **Only the same checkpoint and context size can load a file.** It records a fingerprint of the model, and loading into a different model, or with a different `--context-size`, is refused with an explanation.
+- **Size:** about 0.6GB for the default model (D=256), more for larger models; see [recurrent.md](recurrent.md#saving-and-loading-the-state).
+- **What it remembers:** with the default sliding window, the model only "sees" the last `block_size − 1` tokens of the conversation, exactly as without saving. The message history is kept in full in the file, but older turns beyond the window no longer influence replies.
+- **Interrupting a reply** (Ctrl+C) clears the conversation, because the state may hold a half-read turn.
 
 ## What to expect
 

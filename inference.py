@@ -9,7 +9,7 @@ from contextlib import nullcontext
 import bdh
 import tokenizer as tokenizers
 import torch
-from recurrent import generate_stream_recurrent, sample_next
+from recurrent import RecurrentBDH, generate_stream_recurrent, sample_next
 
 DEFAULT_CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "latest.pt")
 
@@ -17,7 +17,11 @@ DEFAULT_CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "late
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate text from a BDH checkpoint")
     parser.add_argument(
-        "prompt", help=f"text to continue; may contain special tokens such as {tokenizers.EOT}"
+        "prompt",
+        nargs="?",
+        default="",
+        help=f"text to continue; may contain special tokens such as {tokenizers.EOT}. "
+        "May be empty with --load-state, to continue straight from the saved state",
     )
     parser.add_argument("--checkpoint", default=DEFAULT_CKPT_PATH)
     parser.add_argument("--max-new-tokens", type=int, default=200)
@@ -30,6 +34,16 @@ def parse_args():
         "--cuda-graph",
         action="store_true",
         help="with --recurrent on CUDA: record each token step as a CUDA graph and replay it with one launch (faster; see docs/recurrent.md)",
+    )
+    parser.add_argument(
+        "--load-state",
+        metavar="FILE",
+        help="with --recurrent: start from a saved state; the prompt is appended after it",
+    )
+    parser.add_argument(
+        "--save-state",
+        metavar="FILE",
+        help="with --recurrent: save the state after generating (including the generated text), to continue later",
     )
     parser.add_argument(
         "--context-size",
@@ -166,17 +180,19 @@ def generate_stream(model, idx, max_new_tokens, temperature=1.0, top_k=None, con
 
 
 def token_stream(
-    model, prompt_ids, device, recurrent, max_new_tokens, temperature, top_k, context_size, cuda_graph=False, state=None
+    model, prompt_ids, device, recurrent, max_new_tokens, temperature, top_k, context_size, cuda_graph=False,
+    state=None, resume=False,
 ):
     """Generated token ids, by re-reading the window each step or recurrently (see recurrent.py).
 
-    cuda_graph and state only apply to recurrent mode: state is a RecurrentBDH to reuse
-    (keeping its recorded CUDA graph), e.g. across chat turns.
+    cuda_graph, state and resume only apply to recurrent mode: state is a RecurrentBDH to
+    reuse (keeping its recorded CUDA graph), e.g. across chat turns; with resume, the
+    prompt is fed after what the state already holds instead of resetting it.
     """
     if recurrent:
         return generate_stream_recurrent(
             model, prompt_ids, max_new_tokens, temperature=temperature, top_k=top_k,
-            context_size=context_size, state=state, cuda_graph=cuda_graph,
+            context_size=context_size, state=state, cuda_graph=cuda_graph, resume=resume,
         )
     idx = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     return generate_stream(
@@ -188,6 +204,8 @@ def main():
     args = parse_args()
     if args.cuda_graph and not args.recurrent:
         raise SystemExit("--cuda-graph requires --recurrent")
+    if (args.load_state or args.save_state) and not args.recurrent:
+        raise SystemExit("--load-state and --save-state require --recurrent")
     # a redirected stdout on Windows may be cp1252; escape unencodable chars instead of crashing
     sys.stdout.reconfigure(errors="backslashreplace")
     if args.seed is not None:
@@ -233,9 +251,21 @@ def main():
         file=sys.stderr,
     )
 
+    state = None
+    if args.recurrent:
+        state = RecurrentBDH(model, window=context_size or None, cuda_graph=args.cuda_graph)
+        if args.load_state:
+            try:
+                state.load(args.load_state)
+            except (OSError, ValueError) as e:
+                raise SystemExit(f"Can't load state: {e}")
+            print(f"Loaded state {args.load_state} ({state.pos:,} tokens read so far)", file=sys.stderr)
+
     prompt_ids = tok.encode(args.prompt)
-    if not prompt_ids:
+    if not prompt_ids and not args.load_state:
         raise SystemExit("Prompt is empty")
+    # tokens in the state once the prompt is read (recurrent mode), to check below
+    tokens_before = (state.pos if args.load_state else 0) + len(prompt_ids)
 
     # a character can span several tokens (multi-byte UTF-8, byte fallback),
     # so text is decoded incrementally; the stop filter only sees generated text
@@ -259,6 +289,7 @@ def main():
     cpu_start = time.process_time()
     first_token_time = None
     n_generated = 0
+    last_token = None
     emit(prompt_text)
     with ctx:
         for token in token_stream(
@@ -271,10 +302,13 @@ def main():
             args.top_k,
             context_size or None,
             cuda_graph=args.cuda_graph,
+            state=state,
+            resume=bool(args.load_state),
         ):
             if first_token_time is None:
                 first_token_time = time.perf_counter() - start
             n_generated += 1
+            last_token = token
             emit(stop.feed(decoder.feed([token])))
             if stop.stopped:
                 break
@@ -285,6 +319,19 @@ def main():
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
     cpu_time = time.process_time() - cpu_start
+
+    if args.save_state:
+        # the last generated token is only fed when the next one is requested; feed it
+        # now, so a continued run picks up after everything that was generated
+        with ctx:
+            if last_token is not None and len(state.ids) < tokens_before + n_generated:
+                state.step(last_token)
+        state.save(args.save_state)
+        print(
+            f"Saved state {args.save_state} ({state.pos:,} tokens read, "
+            f"{state.state_bytes() / 2**20:,.0f}MB)",
+            file=sys.stderr,
+        )
 
     # stats go to stderr so stdout holds only the generated text
     stats = (
