@@ -75,7 +75,9 @@ This works like the sliding-window KV cache in some transformers (e.g. Mistral).
 | Cost as the context grows | grows up to the window | **constant** |
 | Memory | activations of the whole window | a fixed state (see below) |
 
-**Measured speed isn't available yet.** Expect a large improvement for long outputs; for short ones, less. Generation at batch size 1 is also limited by the overhead of launching many small GPU operations per token, and recurrent mode still has that overhead. Compare the tok/s that `inference.py` prints with and without `--recurrent` on your GPU.
+**Measured on an H100** (byte-level TinyStories model, D=256): **276.5 tok/s for 2,000 tokens with `--recurrent`, versus 63.2 tok/s for 500 tokens with the default method**, about 4.5× faster. Details are in [benchmarks.md](benchmarks.md).
+
+It's still limited by the overhead of launching many small GPU operations per token at batch size 1: one CPU core runs at 100% while the GPU mostly waits. Recording the per-token step as a CUDA graph, or compiling it, could remove most of that overhead. That isn't implemented yet.
 
 **State memory,** always in float32 because it's a long running sum:
 

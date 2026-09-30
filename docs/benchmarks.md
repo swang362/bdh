@@ -81,13 +81,43 @@ The README reports that BDH matches GPT-2 at *equal parameter counts*. Parameter
 
 **What this means:** at equal parameters, BDH uses about 8× the compute of a GPT. At equal wall-clock time, a GPT could process several times more tokens, or be much larger. The runs above don't include a GPT baseline, so **they don't show whether BDH beats GPT under either comparison.**
 
+## Generation speed: recurrent mode
+
+Same byte-level checkpoint (`checkpoints/tinystories/latest.pt`, step 40,000), same H100, default sampling (`top-k` 3), prompt `Once upon a time`. The recurrent run used `--no-stop-at-eot` so that it would generate the full 2,000 tokens.
+
+| | Default method | Recurrent (`--recurrent`) |
+|---|---|---|
+| Tokens generated (measured) | 500 | 2,000 |
+| Time (measured) | 7.91s | 7.23s |
+| Speed including startup (measured) | 63.2 tok/s | **276.5 tok/s** |
+| Speed excluding the first-token startup (derived) | about 67 tok/s | **about 298 tok/s** (about 3.4ms per token) |
+| First-token latency (measured) | 535ms | 520ms |
+| Peak GPU memory (measured) | 834.6MB | 1,071.9MB |
+
+- **About 4.5× faster, with 4× the output.** Recurrent mode's speed per token doesn't depend on how long the output gets, because the state has a fixed size.
+- **Still limited by launching GPU operations.** Compute per token dropped about 70×, but speed only about 4.5×. The run shows `CPU: 100% of one core`: each token runs about a hundred small GPU operations, and the GPU mostly waits for the CPU to launch them. Recording the per-token step as a CUDA graph, or compiling it, could remove most of that overhead. That isn't implemented yet.
+- **Extra memory** comes from the recurrent state: S plus the sliding-window buffers, about 0.6GB for this model.
+
+The same measurement with the SentencePiece model (`checkpoints/ts_sp4096/latest.pt`, step 20,100, vocab 4096), also recurrent, 2,000 tokens:
+
+| | Bytes, recurrent | SentencePiece 4096, recurrent |
+|---|---|---|
+| Time (measured) | 7.23s | 7.65s |
+| Tokens/s including startup (measured) | 276.5 | 261.3 |
+| Tokens/s excluding startup (derived) | about 298 | about 280 |
+| Characters/s (derived; about 3.5–4 bytes per SentencePiece token) | about 298 | **about 1,000** |
+| Peak GPU memory (measured) | 1,071.9MB | 1,094.8MB |
+
+- **The token rate barely changes with the model:** a 16× larger output layer and 2M more parameters cost about 6%. That confirms per-token time is set by launch overhead, not by compute.
+- **Text speed:** SentencePiece with recurrent mode produces about 1,000 characters/s. That's about 4.5–5× the SentencePiece default method (54.6 tok/s ≈ 215 characters/s), and about 15× the byte model with the default method (about 67 characters/s).
+
 ## Limitations
 
 - **One sample per model.** Quality differences between single samples are anecdotal.
 - **No validation loss.** These runs were made before `train.py` evaluated on validation data, so training loss, logged as bits per byte, is the only numeric comparison available. Runs made now log validation bpb every `--eval-freq` steps.
 - **Unequal budgets.** The runs differ in both steps and wall-clock time; the comparison is roughly at equal text seen.
 - **No GPT baseline.** The GPT compute figures are estimates, not measurements.
-- **Slow generation for both models.** It's limited by launching GPU operations (one CPU core at 100%), and it re-processes the full 512-token context for every new token. These runs used that default method. Recurrent mode (`--recurrent`, see [recurrent.md](recurrent.md)) now keeps a fixed-size state instead, so each token costs the same regardless of context length. Its speed hasn't been measured here yet.
+- **Slow generation with the default method.** It's limited by launching GPU operations (one CPU core at 100%), and it re-processes the full 512-token context for every new token. The sample runs above used it. Recurrent mode is about 4.5× faster; see "Generation speed: recurrent mode".
 
 ## Next steps
 
