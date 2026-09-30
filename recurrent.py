@@ -13,8 +13,9 @@ checkpoint; nothing is retrained.
 
 Sliding window (window=W, the training block size by default): the state holds
 at most W - 1 earlier tokens, the most a position sees in training. The oldest
-token's contribution is subtracted when it leaves. While prompt + output fit in
-W tokens, the result equals bdh.BDH.forward exactly (up to rounding). Beyond
+token's contribution is subtracted when it leaves; the last W - 1 tokens' keys
+and values are kept in a ring buffer for that. While prompt + output fit in W
+tokens, the result equals bdh.BDH.forward exactly (up to rounding). Beyond
 that, each token's entry keeps the representation computed when it arrived
 (like a transformer's sliding-window KV cache), rather than being recomputed
 from a truncated window as inference.py's default method does.
@@ -22,9 +23,15 @@ from a truncated window as inference.py's default method does.
 window=None: unlimited. Nothing is ever removed, and memory stays constant, but
 quality degrades past the training length because the state's sums grow larger
 than anything seen in training.
+
+CUDA graphs (cuda_graph=True): at batch size 1 a token step is ~100 small GPU
+operations, and launching them from Python costs more than running them. The
+whole step is recorded once as a CUDA graph and then replayed with one launch.
+All state lives in fixed, preallocated tensors (zeroed in place by reset), so
+the recorded graph stays valid across prompts and chat turns.
 """
 
-import collections
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -45,7 +52,7 @@ def sample_next(logits, temperature=1.0, top_k=None):
 class RecurrentBDH:
     """Runs a trained bdh.BDH model one token at a time with a fixed-size state."""
 
-    def __init__(self, model, window=None):
+    def __init__(self, model, window=None, cuda_graph=False):
         if window is not None and window < 1:
             raise ValueError("window must be at least 1, or None for unlimited")
         self.model = model
@@ -56,49 +63,76 @@ class RecurrentBDH:
         self.N = cfg.mlp_internal_dim_multiplier * self.D // self.nh
         # a position attends to at most window - 1 earlier tokens (the diagonal is excluded)
         self.capacity = None if window is None else window - 1
-        # RoPE frequencies; phases are computed in float64 on the CPU, so absolute
-        # positions stay precise in very long streams (and on devices without float64)
-        self.freqs = model.attn.freqs.detach().view(-1).double().cpu()
         self.device = model.lm_head.device
-        self.reset()
+        freqs = model.attn.freqs.detach().view(-1).double()
+        # RoPE phases are computed in float64, so absolute positions stay precise in
+        # very long streams; on the device where supported, else on the CPU (e.g. MPS)
+        self.phases_on_device = self.device.type != "mps"
+        self.freqs = freqs.to(self.device) if self.phases_on_device else freqs.cpu()
+
+        # all state is preallocated once and only ever modified in place (CUDA graphs
+        # replay fixed memory addresses); float32, since S is a long running sum
+        f32 = dict(device=self.device, dtype=torch.float32)
+        self.S = [torch.zeros(self.nh, self.N, self.D, **f32) for _ in range(self.n_layer)]
+        cap = self.capacity or 0
+        self.ring_q = [torch.zeros(cap, self.nh, self.N, **f32) for _ in range(self.n_layer)] if cap else []
+        self.ring_v = [torch.zeros(cap, self.D, **f32) for _ in range(self.n_layer)] if cap else []
+        self.pos_t = torch.zeros(1, dtype=torch.long, device=self.device)  # position of the next token
+        self.slot_t = torch.zeros(1, dtype=torch.long, device=self.device)  # ring slot of the oldest entry
+        self.token_t = torch.zeros(1, dtype=torch.long, device=self.device)  # input of the next step
+        self.pos = 0
+        self.ids = []
+
+        self.cuda_graph = cuda_graph and self.device.type == "cuda"
+        if cuda_graph and not self.cuda_graph:
+            print("CUDA graphs need a CUDA device; running without them", file=sys.stderr)
+        self.graph = None
+        self.graph_logits = None
 
     def reset(self):
         """Forget everything: empty state, position 0."""
-        # the state is kept in float32: it is a long running sum
-        self.S = [
-            torch.zeros(self.nh, self.N, self.D, device=self.device, dtype=torch.float32)
-            for _ in range(self.n_layer)
-        ]
-        # (rotated key, value) of each token still in the window, to subtract it when it leaves
-        self.entries = [collections.deque() for _ in range(self.n_layer)]
+        for t in self.S + self.ring_q + self.ring_v:
+            t.zero_()
+        self.pos_t.zero_()
+        self.slot_t.zero_()
         self.pos = 0
         self.ids = []
 
     def state_bytes(self):
-        """Memory used by the state and the window buffers."""
-        s = sum(t.numel() * t.element_size() for t in self.S)
-        e = sum(q.numel() * q.element_size() + v.numel() * v.element_size() for d in self.entries for q, v in d)
-        return s + e
+        """Memory used by the state and the ring buffer."""
+        return sum(t.numel() * t.element_size() for t in self.S + self.ring_q + self.ring_v)
+
+    def _state_tensors(self):
+        return self.S + self.ring_q + self.ring_v + [self.pos_t, self.slot_t]
+
+    def _phases(self):
+        if self.phases_on_device:
+            return ((self.pos_t.double() * self.freqs) % 1).float()
+        return ((self.pos * self.freqs) % 1).float().to(self.device)
 
     def _attend(self, layer, q, v):
         """Read the state for rotated query q (nh, N), then add this token (q, v)."""
         S = self.S[layer]
         y = torch.bmm(q.unsqueeze(1), S).squeeze(1)  # (nh, D): tokens before this one
+        if self.capacity == 0:
+            return y  # window 1: no earlier token is ever kept
         S.addcmul_(q.unsqueeze(-1), v.view(1, 1, -1))
         if self.capacity is not None:
-            entries = self.entries[layer]
-            entries.append((q, v))
-            if len(entries) > self.capacity:
-                old_q, old_v = entries.popleft()
-                S.addcmul_(old_q.unsqueeze(-1), old_v.view(1, 1, -1), value=-1)
+            # subtract the oldest entry (all zeros while the ring isn't full yet, which
+            # is an exact no-op) and put this token in its slot
+            ring_q, ring_v = self.ring_q[layer], self.ring_v[layer]
+            old_q = ring_q.index_select(0, self.slot_t)[0]
+            old_v = ring_v.index_select(0, self.slot_t)[0]
+            S.addcmul_(old_q.unsqueeze(-1), old_v.view(1, 1, -1), value=-1)
+            ring_q.index_copy_(0, self.slot_t, q.unsqueeze(0))
+            ring_v.index_copy_(0, self.slot_t, v.unsqueeze(0))
         return y
 
-    @torch.no_grad()
-    def step(self, token):
-        """Feed one token; returns the logits (vocab,) for the next token."""
+    def _step_body(self):
+        """One token step on tensors only (no Python-side decisions), so it can be graphed."""
         m = self.model
-        phases = ((self.pos * self.freqs) % 1).float().to(self.device)
-        x = m.ln(m.embed.weight[token])  # (D,)
+        phases = self._phases()
+        x = m.ln(m.embed.weight.index_select(0, self.token_t)[0])  # (D,)
         for layer in range(self.n_layer):
             # same computation as BDH.forward for a single position
             x_sparse = F.relu(torch.einsum("d,hdn->hn", x, m.encoder))  # (nh, N)
@@ -110,9 +144,51 @@ class RecurrentBDH:
             xy_sparse = x_sparse * y_sparse
             y_mlp = xy_sparse.reshape(-1) @ m.decoder  # heads concatenated, as in forward
             x = m.ln(x + m.ln(y_mlp))
+        self.pos_t.add_(1)
+        if self.capacity:
+            self.slot_t.add_(1).remainder_(self.capacity)
+        return x @ m.lm_head
+
+    def _capture(self):
+        """Record _step_body as a CUDA graph; falls back to normal execution on failure."""
+        try:
+            # warm up on a side stream (required before capture), then restore the state
+            backup = [t.clone() for t in self._state_tensors()]
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            # the graph runs in float32 (TF32 if enabled): launch overhead, not
+            # precision, limits speed at batch size 1, and autocast's weight cache
+            # doesn't mix with graph capture
+            with torch.cuda.stream(stream), torch.autocast(device_type="cuda", enabled=False):
+                for _ in range(2):
+                    self._step_body()
+            torch.cuda.current_stream().wait_stream(stream)
+            for t, b in zip(self._state_tensors(), backup):
+                t.copy_(b)
+            del backup
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph), torch.autocast(device_type="cuda", enabled=False):
+                self.graph_logits = self._step_body()
+            self.graph = graph
+        except Exception as e:  # e.g. an unsupported operation or driver issue
+            print(f"CUDA graph capture failed ({e}); running without it", file=sys.stderr)
+            self.cuda_graph = False
+            self.graph = None
+
+    @torch.no_grad()
+    def step(self, token):
+        """Feed one token; returns the logits (vocab,) for the next token."""
+        self.token_t.fill_(token)
+        if self.cuda_graph and self.graph is None:
+            self._capture()
+        if self.graph is not None:
+            self.graph.replay()
+            logits = self.graph_logits.clone()  # the graph's output buffer is reused
+        else:
+            logits = self._step_body()
         self.pos += 1
         self.ids.append(token)
-        return x @ m.lm_head
+        return logits
 
     @torch.no_grad()
     def prefill(self, ids):
@@ -142,27 +218,34 @@ class RecurrentBDH:
                 # build the state from the last `keep` tokens' rotated keys and values
                 q = Attention.rope(positions * m.attn.freqs, x_sparse.float())[0]  # (nh, T, N)
                 v = x[0, 0].float()  # (T, D)
-                self.S[layer] = torch.matmul(q[:, T - keep :].transpose(1, 2), v[T - keep :])
-                if self.capacity is not None:
-                    self.entries[layer].extend((q[:, t], v[t]) for t in range(T - keep, T))
+                self.S[layer].copy_(torch.matmul(q[:, T - keep :].transpose(1, 2), v[T - keep :]))
+                if self.capacity:
+                    # oldest first in slots 0..keep-1; the next write goes to slot keep % capacity
+                    self.ring_q[layer][:keep].copy_(q[:, T - keep :].transpose(0, 1))
+                    self.ring_v[layer][:keep].copy_(v[T - keep :])
             y_kv = m.ln(y_kv)
             y_sparse = F.relu(y_kv @ m.encoder_v)
             xy_sparse = x_sparse * y_sparse
             y_mlp = xy_sparse.transpose(1, 2).reshape(1, 1, T, -1) @ m.decoder
             x = m.ln(x + m.ln(y_mlp))
         self.pos = T
+        self.pos_t.fill_(T)
+        if self.capacity:
+            self.slot_t.fill_(keep % self.capacity)
         self.ids = list(ids)
-        return (x[0, 0, -1] @ m.lm_head)
+        return x[0, 0, -1] @ m.lm_head
 
 
 @torch.no_grad()
-def generate_stream_recurrent(model, ids, max_new_tokens, temperature=1.0, top_k=None, context_size=None, state=None):
+def generate_stream_recurrent(
+    model, ids, max_new_tokens, temperature=1.0, top_k=None, context_size=None, state=None, cuda_graph=False
+):
     """Like inference.generate_stream, but recurrent. ids is a list of prompt token ids.
 
     context_size is the sliding window (None: unlimited). Pass a RecurrentBDH as
-    state to reuse its buffers; it is reset first.
+    state to reuse it, including a recorded CUDA graph; it is reset first.
     """
-    rec = state if state is not None else RecurrentBDH(model, window=context_size)
+    rec = state if state is not None else RecurrentBDH(model, window=context_size, cuda_graph=cuda_graph)
     logits = rec.prefill(ids)
     for i in range(max_new_tokens):
         token = sample_next(logits.float().unsqueeze(0), temperature, top_k).item()

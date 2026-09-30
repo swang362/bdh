@@ -26,6 +26,7 @@ import tokenizer as tokenizers
 import torch
 
 from inference import token_stream
+from recurrent import RecurrentBDH
 
 # (prompt, accepted answers). A probe is correct if any answer appears as a whole
 # word (case-insensitive) in the greedy continuation. Most prompts follow
@@ -112,6 +113,7 @@ def parse_args():
         action="store_true",
         help="generate recurrently (docs/recurrent.md); scores should match the default method",
     )
+    p.add_argument("--cuda-graph", action="store_true", help="with --recurrent on CUDA: replay token steps as a CUDA graph")
     p.add_argument("--csv", help="also write the per-checkpoint results to this CSV file")
     p.add_argument("--cpu", action="store_true", help="run on CPU even if a GPU is available")
     return p.parse_args()
@@ -156,13 +158,16 @@ def probe_checkpoint(path, probes, args, device, ctx):
     del checkpoint
 
     results = []
+    # recurrent mode: one state for all probes, so a CUDA graph is recorded only once
+    state = RecurrentBDH(model, window=context_size or None, cuda_graph=args.cuda_graph) if args.recurrent else None
     for prompt, answers in probes:
         ids = tok.encode(prompt)
         with ctx:
             # top_k=1 is greedy decoding: deterministic, the model's single best guess
             new = list(
                 token_stream(
-                    model, ids, device, args.recurrent, args.max_new_tokens, 1.0, 1, context_size or None
+                    model, ids, device, args.recurrent, args.max_new_tokens, 1.0, 1, context_size or None,
+                    cuda_graph=args.cuda_graph, state=state,
                 )
             )
         # decode the whole sequence and cut the prompt, so text spanning the
@@ -171,7 +176,7 @@ def probe_checkpoint(path, probes, args, device, ctx):
         completion = full[len(tok.decode(ids)):].split(tokenizers.EOT)[0]
         results.append((prompt, answers, completion, is_correct(completion, answers)))
 
-    del model
+    del model, state
     if device.type == "cuda":
         torch.cuda.empty_cache()
     return step, results

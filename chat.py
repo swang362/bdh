@@ -21,6 +21,7 @@ import torch
 import chat_format
 import tokenizer as tokenizers
 from inference import StopAtText, token_stream
+from recurrent import RecurrentBDH
 
 DEFAULT_CKPT_PATH = os.path.join(os.path.dirname(__file__), "checkpoints", "chat", "best.pt")
 
@@ -42,6 +43,11 @@ def parse_args():
         "--recurrent",
         action="store_true",
         help="generate recurrently with a fixed-size state: faster, especially in long conversations (see docs/recurrent.md)",
+    )
+    p.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="with --recurrent on CUDA: replay each token step as a recorded CUDA graph (faster); recorded once per session",
     )
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--cpu", action="store_true", help="run on CPU even if a GPU is available")
@@ -65,9 +71,14 @@ def load_model(path, device):
 
 
 def generate_reply(
-    model, tok, messages, context_size, max_new_tokens=256, temperature=0.7, top_k=20, on_text=None, recurrent=False
+    model, tok, messages, context_size, max_new_tokens=256, temperature=0.7, top_k=20, on_text=None,
+    recurrent=False, cuda_graph=False, state=None,
 ):
-    """Generate the assistant's reply to messages; on_text receives text as it streams."""
+    """Generate the assistant's reply to messages; on_text receives text as it streams.
+
+    In recurrent mode, pass the same RecurrentBDH as state every turn to reuse its
+    buffers and recorded CUDA graph (it is reset and re-read from messages each time).
+    """
     ids, _ = chat_format.encode(tok, messages, add_generation_prompt=True)
     device = next(model.parameters()).device
     decoder = tok.stream_decoder()
@@ -82,7 +93,8 @@ def generate_reply(
                 on_text(text)
 
     for token in token_stream(
-        model, ids, device, recurrent, max_new_tokens, temperature, top_k, context_size or None
+        model, ids, device, recurrent, max_new_tokens, temperature, top_k, context_size or None,
+        cuda_graph=cuda_graph, state=state,
     ):
         emit(stop.feed(decoder.feed([token])))
         if stop.stopped:
@@ -94,6 +106,8 @@ def generate_reply(
 
 def main():
     args = parse_args()
+    if args.cuda_graph and not args.recurrent:
+        raise SystemExit("--cuda-graph requires --recurrent")
     sys.stdout.reconfigure(errors="backslashreplace")
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -107,7 +121,8 @@ def main():
     system = args.system if args.system is not None else (info["chat"] or {}).get("system")
     print(
         f"Loaded {args.checkpoint} (step {info['step']}) on {device}, context {context_size or 'unlimited'}"
-        + (", recurrent" if args.recurrent else ""),
+        + (", recurrent" if args.recurrent else "")
+        + (" with CUDA graph" if args.recurrent and args.cuda_graph else ""),
         file=sys.stderr,
     )
     if not info["chat"]:
@@ -116,6 +131,8 @@ def main():
             "replies will be plain text continuation.",
             file=sys.stderr,
         )
+    # one recurrent state for the whole session: its buffers and CUDA graph are reused every turn
+    state = RecurrentBDH(model, window=context_size or None, cuda_graph=args.cuda_graph) if args.recurrent else None
 
     def ask(history, question):
         messages = ([{"role": "system", "content": system}] if system else []) + history
@@ -124,7 +141,7 @@ def main():
             reply = generate_reply(
                 model, tok, messages, context_size, args.max_new_tokens, args.temperature, args.top_k,
                 on_text=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
-                recurrent=args.recurrent,
+                recurrent=args.recurrent, state=state,
             )
         print()
         return reply

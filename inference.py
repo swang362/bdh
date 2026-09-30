@@ -27,6 +27,11 @@ def parse_args():
         help="generate recurrently with a fixed-size state instead of re-reading the context for every token (see docs/recurrent.md)",
     )
     parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="with --recurrent on CUDA: record each token step as a CUDA graph and replay it with one launch (faster; see docs/recurrent.md)",
+    )
+    parser.add_argument(
         "--context-size",
         type=int,
         default=None,
@@ -160,11 +165,18 @@ def generate_stream(model, idx, max_new_tokens, temperature=1.0, top_k=None, con
         yield idx_next.item()
 
 
-def token_stream(model, prompt_ids, device, recurrent, max_new_tokens, temperature, top_k, context_size):
-    """Generated token ids, by re-reading the window each step or recurrently (see recurrent.py)."""
+def token_stream(
+    model, prompt_ids, device, recurrent, max_new_tokens, temperature, top_k, context_size, cuda_graph=False, state=None
+):
+    """Generated token ids, by re-reading the window each step or recurrently (see recurrent.py).
+
+    cuda_graph and state only apply to recurrent mode: state is a RecurrentBDH to reuse
+    (keeping its recorded CUDA graph), e.g. across chat turns.
+    """
     if recurrent:
         return generate_stream_recurrent(
-            model, prompt_ids, max_new_tokens, temperature=temperature, top_k=top_k, context_size=context_size
+            model, prompt_ids, max_new_tokens, temperature=temperature, top_k=top_k,
+            context_size=context_size, state=state, cuda_graph=cuda_graph,
         )
     idx = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     return generate_stream(
@@ -174,6 +186,8 @@ def token_stream(model, prompt_ids, device, recurrent, max_new_tokens, temperatu
 
 def main():
     args = parse_args()
+    if args.cuda_graph and not args.recurrent:
+        raise SystemExit("--cuda-graph requires --recurrent")
     # a redirected stdout on Windows may be cp1252; escape unencodable chars instead of crashing
     sys.stdout.reconfigure(errors="backslashreplace")
     if args.seed is not None:
@@ -214,7 +228,8 @@ def main():
         f"Loaded {args.checkpoint} (step {checkpoint['step']}) on {device}, "
         f"{tok.type} tokenizer (vocab {tok.vocab_size}), "
         f"context {context_size or 'unlimited'}"
-        + (", recurrent" if args.recurrent else ""),
+        + (", recurrent" if args.recurrent else "")
+        + (" with CUDA graph" if args.recurrent and args.cuda_graph else ""),
         file=sys.stderr,
     )
 
@@ -255,6 +270,7 @@ def main():
             args.temperature,
             args.top_k,
             context_size or None,
+            cuda_graph=args.cuda_graph,
         ):
             if first_token_time is None:
                 first_token_time = time.perf_counter() - start

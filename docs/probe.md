@@ -32,6 +32,7 @@ python probe.py checkpoints/wiki_sp16384/best.pt --probes my_probes.json
 | `--context-size N` | training block size from the checkpoint | Context window, as in `inference.py` |
 | `--verbose` | off | Print every completion, marked `[OK]` or `[--]` |
 | `--recurrent` | off | Generate with recurrent mode ([recurrent.md](recurrent.md)). Probes are short, so scores are identical and speed barely changes. It's useful as a check that both methods agree |
+| `--cuda-graph` | off | With `--recurrent` on CUDA: replay token steps as a CUDA graph, recorded once per checkpoint |
 | `--csv FILE` | none | Also write one row per checkpoint: checkpoint, step, correct, total, accuracy |
 | `--cpu` | off | Run on the CPU |
 

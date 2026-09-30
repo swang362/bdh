@@ -111,6 +111,24 @@ The same measurement with the SentencePiece model (`checkpoints/ts_sp4096/latest
 - **The token rate barely changes with the model:** a 16× larger output layer and 2M more parameters cost about 6%. That confirms per-token time is set by launch overhead, not by compute.
 - **Text speed:** SentencePiece with recurrent mode produces about 1,000 characters/s. That's about 4.5–5× the SentencePiece default method (54.6 tok/s ≈ 215 characters/s), and about 15× the byte model with the default method (about 67 characters/s).
 
+### With CUDA graphs (`--recurrent --cuda-graph`)
+
+Same SentencePiece checkpoint (`ts_sp4096/latest.pt`, step 20,100), 2,000 tokens, H100:
+
+| | Recurrent | Recurrent + CUDA graph |
+|---|---|---|
+| Time (measured) | 7.65s | **3.77s** |
+| Tokens/s including startup (measured) | 261.3 | **529.9** |
+| Time per token excluding startup (derived) | about 3.6ms | **about 1.6ms** |
+| Tokens/s excluding startup (derived) | about 280 | **about 615** |
+| Characters/s (derived) | about 1,000 | **about 2,200–2,400** |
+| First-token latency (measured) | 504ms | 519ms (includes recording the graph) |
+| Peak GPU memory (measured) | 1,094.8MB | 1,720.9MB |
+
+- **About 2.2× faster:** the graph removes about 2ms of launch overhead per token. Compared with the SentencePiece default method (about 77 tok/s excluding startup), that's about 8×.
+- **The higher peak memory** is temporary: recording keeps a backup copy of the state (about 0.6GB for this model) during warm-up.
+- **One CPU core is still at 100%.** Sampling (about 6–8 small GPU operations), `.item()` waiting for each token, and Python-side decoding still run per token outside the graph. Moving sampling into the graph, or compiling the step, could gain more; neither is implemented.
+
 ## Limitations
 
 - **One sample per model.** Quality differences between single samples are anecdotal.

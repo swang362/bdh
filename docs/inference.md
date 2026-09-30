@@ -17,6 +17,7 @@ The checkpoint provides the model config, the tokenizer and the training block s
 | `--max-new-tokens N` | 200 | Maximum tokens to generate |
 | `--context-size N` | training block size from the checkpoint | How many recent tokens the model sees at each step. `0` means unlimited (not recommended, see below) |
 | `--recurrent` | off | Generate with a fixed-size recurrent state instead of re-reading the context for every token. Much less compute per token, and constant speed however long the output. Identical output while prompt plus output fit in the context window. See [recurrent.md](recurrent.md) |
+| `--cuda-graph` | off | With `--recurrent` on CUDA: record each token step as a CUDA graph and replay it with one launch, removing most of the per-token launch overhead. Falls back automatically if recording fails. See [recurrent.md](recurrent.md#cuda-graphs---cuda-graph) |
 | `--temperature T` | 1.0 | Sampling temperature; lower is more predictable. Must be above 0 |
 | `--top-k K` | 3 | Only sample from the K most likely tokens. `--top-k 1` always picks the most likely token (greedy) |
 | `--seed N` | none | Makes the output reproducible |

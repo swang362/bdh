@@ -112,6 +112,7 @@ python chat.py [question] [--checkpoint FILE] [options]
 | `--context-size N` | checkpoint's block size | Context window. Long conversations keep only the most recent tokens |
 | `--no-history` | off | Answer each question independently |
 | `--recurrent` | off | Generate with a fixed-size recurrent state: faster, especially in long conversations. Same replies while the conversation fits in the context window. See [recurrent.md](recurrent.md) |
+| `--cuda-graph` | off | With `--recurrent` on CUDA: replay each token step as a recorded CUDA graph, for faster replies. Recorded once, on the first reply, and reused for the whole session |
 | `--seed N` | none | Reproducible sampling |
 | `--cpu` | off | Run on the CPU |
 

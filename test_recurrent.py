@@ -10,6 +10,8 @@ Optionally also checks a real checkpoint (a slice of real text isn't needed:
 random token ids exercise the same computation):
 
     python test_recurrent.py --checkpoint checkpoints/wiki_sp16384/best.pt
+
+With a CUDA GPU it also checks CUDA graph replay (recurrent.py, cuda_graph=True).
 """
 
 import argparse
@@ -17,6 +19,7 @@ import argparse
 import torch
 
 import bdh
+from bdh import Attention
 from recurrent import RecurrentBDH
 
 TOLERANCE = 1e-3  # max |difference| of logits, relative to the largest logit
@@ -58,20 +61,60 @@ def run_checks(model, T, window, device):
     windowed = torch.stack([rec.step(t) for t in ids])
     ok &= check(f"window {T} vs forward (fits in window)", rel_diff(windowed, ref))
 
-    # 4. beyond the window: prefill and step-by-step agree, and the state never
-    #    holds more than window - 1 tokens
-    w = max(2, window // 2)
+    # 4. beyond the window: prefill + steps and step-by-step agree with a slow,
+    #    independent reference that sums the last window - 1 tokens explicitly
+    w = min(32, max(2, window // 2))
     long_ids = torch.randint(0, vocab, (3 * w,), generator=gen).tolist()
-    rec_a = RecurrentBDH(model, window=w)
-    a = rec_a.prefill(long_ids)
-    rec_b = RecurrentBDH(model, window=w)
-    for t in long_ids:
-        b = rec_b.step(t)
-    ok &= check(f"window {w}, {3 * w} tokens: prefill vs step-by-step", rel_diff(a, b))
-    held = max(len(e) for e in rec_b.entries)
-    ok &= held <= w - 1
-    print(f"  [{'OK' if held <= w - 1 else 'FAIL'}] window {w}: state holds {held} tokens (max {w - 1})")
+    expected = reference_windowed(model, long_ids, w, device)
+    rec = RecurrentBDH(model, window=w)
+    stepped = torch.stack([rec.step(t) for t in long_ids])
+    ok &= check(f"window {w}, {3 * w} tokens: step-by-step vs reference", rel_diff(stepped, expected))
+    rec = RecurrentBDH(model, window=w)
+    first = rec.prefill(long_ids[: 2 * w])
+    rest = torch.stack([rec.step(t) for t in long_ids[2 * w :]])
+    got = torch.cat([first[None], rest])
+    ok &= check(f"window {w}, {3 * w} tokens: prefill + steps vs reference", rel_diff(got, expected[2 * w - 1 :]))
+
+    # 5. CUDA graph replay equals normal execution (CUDA only)
+    if device.type == "cuda":
+        rec = RecurrentBDH(model, window=w, cuda_graph=True)
+        graphed = torch.stack([rec.step(t) for t in long_ids])
+        if rec.graph is None:
+            print("  [FAIL] CUDA graph was not captured")
+            ok = False
+        else:
+            ok &= check(f"CUDA graph vs reference, window {w}, {3 * w} tokens", rel_diff(graphed, expected))
+            # reset and reuse the same recorded graph, as chat.py does across turns
+            first = rec.prefill(long_ids[:w])
+            rest = torch.stack([rec.step(t) for t in long_ids[w:]])
+            got = torch.cat([first[None], rest])
+            ok &= check("CUDA graph reused after reset", rel_diff(got, expected[w - 1 :]))
     return ok
+
+
+@torch.no_grad()
+def reference_windowed(model, ids, window, device):
+    """Slow reference for the sliding window: every position explicitly sums the
+    contributions of the last window - 1 tokens, kept in plain Python lists."""
+    m = model
+    cap = window - 1
+    freqs = m.attn.freqs.view(-1).double().cpu()
+    entries = [[] for _ in range(m.config.n_layer)]
+    out = []
+    for pos, token in enumerate(ids):
+        phases = ((pos * freqs) % 1).float().to(device)
+        x = m.ln(m.embed.weight[token])
+        for layer in range(m.config.n_layer):
+            x_sparse = torch.relu(torch.einsum("d,hdn->hn", x, m.encoder))
+            q = Attention.rope(phases, x_sparse)
+            y = torch.zeros(m.config.n_head, m.config.n_embd, device=device)
+            for kq, kv in entries[layer][-cap:]:
+                y += (q * kq).sum(-1, keepdim=True) * kv
+            entries[layer].append((q, x))
+            y_sparse = torch.relu(torch.einsum("hd,hdn->hn", m.ln(y), m.encoder_v))
+            x = m.ln(x + m.ln((x_sparse * y_sparse).reshape(-1) @ m.decoder))
+        out.append(x @ m.lm_head)
+    return torch.stack(out)
 
 
 def main():
@@ -81,10 +124,17 @@ def main():
     p.add_argument("--cpu", action="store_true", help="run the checkpoint check on CPU")
     args = p.parse_args()
     torch.manual_seed(0)
+    # float32 matmuls, so differences reflect the method, not bf16/TF32 rounding
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
     print("Small random model (CPU, float32):")
     cfg = bdh.BDHConfig(n_layer=3, n_embd=64, n_head=4, dropout=0.0, mlp_internal_dim_multiplier=16, vocab_size=97)
-    ok = run_checks(bdh.BDH(cfg).eval(), T=48, window=48, device=torch.device("cpu"))
+    small = bdh.BDH(cfg).eval()
+    ok = run_checks(small, T=48, window=48, device=torch.device("cpu"))
+    if torch.cuda.is_available() and not args.cpu:
+        print("\nSmall random model (CUDA, float32, includes the CUDA graph checks):")
+        ok &= run_checks(small.to("cuda"), T=48, window=48, device=torch.device("cuda"))
 
     if args.checkpoint:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
@@ -92,9 +142,6 @@ def main():
         model = bdh.BDH(bdh.BDHConfig(**checkpoint["config"]))
         model.load_state_dict(checkpoint["model"])
         model.to(device).eval()
-        # float32 matmuls, so differences reflect the method, not bf16/TF32 rounding
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
         window = checkpoint.get("block_size", 512)
         print(f"\n{args.checkpoint} ({device}, float32, window {window}):")
         ok &= run_checks(model, T=min(args.tokens, window), window=window, device=device)
