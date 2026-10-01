@@ -12,6 +12,7 @@ This folder documents the command-line scripts for training and running BDH mode
 | `probe.py` | Score fact recall of checkpoints with greedy completions | [probe.md](probe.md) |
 | `finetune.py` | Fine-tune a checkpoint on question-and-answer data for chat | [chat.md](chat.md) |
 | `chat.py` | Chat with, or ask questions to, a fine-tuned checkpoint | [chat.md](chat.md) |
+| `export_hf.py` | Export a GPT checkpoint in Hugging Face Llama format, for conversion to quantized GGUF files with llama.cpp | [export.md](export.md) |
 
 Each script also prints its full option list with `--help`.
 
