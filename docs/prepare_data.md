@@ -79,6 +79,10 @@ python prepare_data.py text --input corpus.txt --val-fraction 0.05
 # Encode another dataset with an existing tokenizer, so a model can be trained or evaluated on both
 python prepare_data.py text --input other.txt --tokenizer sentencepiece \
     --tokenizer-model data/tinystories_sp4096/tokenizer.model --name other_sp4096
+
+# Wikipedia with FineWeb-Edu's tokenizer, to mix the two in training (train.py --data-dir A B)
+python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece \
+    --tokenizer-model data/fineweb-edu_4shards_sp32768/tokenizer.model --name wikipedia_2shards_fwe
 ```
 
 ## meta.json

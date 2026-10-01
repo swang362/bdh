@@ -1,122 +1,45 @@
 # Training on FineWeb-Edu
 
-A recipe for training a BDH model on FineWeb-Edu with a **2048-token context window**: a D=512 model of about 134M parameters, trained on about 2.3B tokens in two stages.
+Recipes for training BDH models on FineWeb-Edu:
 
-Status: **a plan.** Times and memory figures are estimates scaled from the measured D=256 runs in [benchmarks.md](benchmarks.md), not measurements. Check them on your hardware before committing to a long run (see "Before the long run").
+| Recipe | Model | Context | Tokens | H100 time | Status |
+|---|---|---|---|---|---|
+| [1. Quick](#recipe-1-quick-d256) | D=256, about 34M parameters, 16K vocabulary | 512 | about 0.65B | **about 64 min (measured)** | Done: 1.1739 bpb, probe 14/50 |
+| [2. Standard](#recipe-2-standard-d512-2048-token-context) | D=512, about 134M parameters, 32K vocabulary | **2048** | about 2.3B | about 14–17 h (estimate) | Planned |
+
+Also on this page: an [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) that decides whether recipe 2 mixes in Wikipedia, and [how to improve fact recall](#improving-fact-recall).
 
 ## Why FineWeb-Edu
 
 - **Educational web pages** (`HuggingFaceFW/fineweb-edu`, 10B-token sample): explanations, textbooks, course material. More reasoning-style text per token than Wikipedia.
 - **Plenty of data:** 14 parquet shards, about 700M tokens each. The model sees each token about once, so dropout isn't needed.
 - **Long documents:** many are longer than 512 tokens, so there's real distant context for a longer window to learn from. TinyStories doesn't have this.
+- **Better fact recall than Wikipedia at small sizes:** recipe 1 scored 14/50 on `probe.py`, against 6/50 for a Wikipedia model of the same size and tokens.
 
-## The method
+**Settings shared by both recipes:** `--n-layer 6 --n-head 4 --mlp-mult 128` (the defaults and the paper's settings; `--n-embd` is the size knob), `--dropout 0.0`, 32K tokens per step, `--weight-decay 0.1`, `--eval-freq 1000`.
 
-1. **Stage 1: train at 512 tokens** for about 85% of the steps. Short blocks are cheap, and the model learns the language there.
-2. **Stage 2: continue at 2048 tokens** for the last 15%. The model learns to use the longer context.
+**Comparing results:**
+- **Bits per byte is comparable across tokenizers, not across datasets.** FineWeb-Edu's about 1.17 is higher than Wikipedia's about 1.0 because web text is more varied, not because the model is worse.
+- **Validation bpb also changes with the block size and the data mix,** so compare checkpoints trained under the same settings.
+- **For knowledge, use `probe.py`:** `python probe.py CHECKPOINT ... --verbose` compares checkpoints on the same 50 facts.
 
-Most long-context models are trained this way. Training at 2048 from the start works too, but costs much more for little gain:
+---
 
-| Block size | Training cost per token (512 = 1×) | 2.3B tokens, all at this length (H100) |
-|---|---|---|
-| 512 | 1× | about 12–16 h |
-| 1024 | about 1.25× | about 15–20 h |
-| 2048 | about 1.75× | about 21–28 h |
-| 2048 with `--attn-chunk 256` | about 1.4× | about 17–22 h |
-| **60K steps at 512, then 10K at 2048 with `--attn-chunk 256`** | | **about 14–17 h** |
+## Recipe 1: Quick (D=256)
 
-Attention cost grows with block length; the rest of the model's cost doesn't. At D=512, attention is about a quarter of the cost at 512 tokens, and more than half at 2048. Chunked attention (`--attn-chunk`, see [train.md](train.md#chunked-attention-for-long-blocks---attn-chunk)) computes the same model with a cost that grows linearly with block length. At D=512 it pays off above about 1,300 tokens, so it's used in stage 2 only.
+A small model trained in about an hour. It matches the size of the Wikipedia model from the [quick start](README.md#quick-start), so comparing the two shows the effect of the data alone.
 
-## Model and settings
+| Setting | Value |
+|---|---|
+| `--n-embd` | 256 |
+| Vocabulary | 16384 (SentencePiece) |
+| Data | 1 shard of FineWeb-Edu |
+| `--block-size` | 512 |
+| `--batch-size` / `--grad-accum` | 64 / 2 |
+| `--max-iters` | 20,000 |
+| `--lr` / `--warmup-iters` | 1e-3 / 1000 |
 
-| Setting | Value | Why |
-|---|---|---|
-| `--n-embd` | 512 | 4× the default model's size, and still overnight on one H100 |
-| `--n-layer`, `--n-head`, `--mlp-mult` | 6, 4, 128 | The defaults and the paper's settings |
-| Vocabulary | 32768 (SentencePiece) | Web text is varied, so a larger vocabulary puts more text in each token. Each 512-token block then holds more context. The extra embedding parameters are cheap at D=512, and ids still fit in uint16 |
-| Parameters | about 134M | 3 · 128 · 512² + 2 · 32768 · 512 |
-| `--dropout` | 0.0 | Each token is seen about once, so there's nothing to overfit |
-| `--lr` | 6e-4 | Lower than D=256's 1e-3: larger models are less stable at the same rate |
-| `--warmup-iters` | 2000 | |
-| `--weight-decay` | 0.1 | |
-| Tokens per step | 32K (64 × 512, then 16 × 2048) | The same in both stages |
-| `--grad-accum` | 4 | BDH's sparse activations are large (batch × tokens × 16384 values per head, several per layer), so a full batch doesn't fit in 80GB. Each micro-batch is 8K tokens in both stages |
-| Steps | 60,000 + 10,000 | About 2.3B tokens, close to 20 tokens per parameter |
-
-## Commands
-
-**Prepare the data** (4 shards, about 2.8B tokens, with a held-out validation split):
-
-```
-python prepare_data.py fineweb-edu --shards 4 --tokenizer sentencepiece --vocab-size 32768
-```
-
-Check the output folder name it prints; the commands below assume `data/fineweb-edu_4shards_sp32768`.
-
-**Stage 1: 60,000 steps at 512 tokens**
-
-```
-python train.py --data-dir data/fineweb-edu_4shards_sp32768 --ckpt-dir checkpoints/fwe_d512 \
-    --n-embd 512 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
-    --block-size 512 --batch-size 64 --grad-accum 4 \
-    --max-iters 60000 --lr 6e-4 --warmup-iters 2000 --weight-decay 0.1 \
-    --eval-freq 1000 --snapshot-freq 10000
-```
-
-**Stage 2: resume, and continue to 70,000 steps at 2048 tokens**
-
-```
-python train.py --data-dir data/fineweb-edu_4shards_sp32768 --ckpt-dir checkpoints/fwe_d512 \
-    --n-embd 512 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
-    --block-size 2048 --batch-size 16 --grad-accum 4 --attn-chunk 256 \
-    --max-iters 70000 --lr 6e-4 --warmup-iters 2000 --weight-decay 0.1 \
-    --eval-freq 1000 --snapshot-freq 5000
-```
-
-Stage 2 resumes from `checkpoints/fwe_d512/latest.pt`, at step 60,000. `--attn-chunk 256` changes only how attention is computed, not the model.
-
-## What happens at the switch
-
-- **Changing the block size on resume works.** `train.py` checks the model options and the tokenizer when it resumes, not the block size. Checkpoints from stage 2 record 2048, so `inference.py`, `chat.py` and `finetune.py` use a 2048-token window automatically.
-- **The learning rate ticks up slightly.** Stage 1's cosine schedule ends at 6e-5. Stage 2 resumes partway through a 70,000-step schedule, at about 9e-5, and decays back to 6e-5. A small bump like this is harmless, and it helps the model adapt to the longer blocks.
-- **Validation bpb drops at the switch.** With more context, every prediction gets easier, so numbers before and after step 60,000 aren't directly comparable. Compare stage 2 checkpoints only with each other. `best.pt` will likely move to a stage-2 checkpoint at the first evaluation, which is expected.
-- **Memory stays about the same:** micro-batches are 8K tokens in both stages. With `--attn-chunk`, no `block × block` score matrices are stored at all.
-
-## Before the long run
-
-1. **Measure the speed.** Run stage 1 for about 200 steps and read tok/s from the log. Hours for stage 1 ≈ 1.97B tokens ÷ tok/s ÷ 3600, and stage 2 is about 1.75× slower per token. Stop with Ctrl+C; running the same command again resumes.
-2. **Check memory.** If either stage runs out of memory, double `--grad-accum`. Tokens per step stay the same, so the results don't change.
-3. **Check that chunked attention pays off on your GPU:** `python test_chunked.py --bench --n-embd 512` runs the correctness checks, then times training steps with full and chunked attention at several block sizes. Use the fastest chunk size at 2048, or drop `--attn-chunk` if full attention is faster.
-4. **Do the same quick check for stage 2** before the real switch: resume a copy of an early checkpoint at `--block-size 2048` in a separate `--ckpt-dir` for a few dozen steps.
-
-## During training
-
-- **Validation bpb should still be falling at step 60,000.** If it flattens early, the model is too small for the data, and the larger variant below is the next step.
-- **Loss spikes** that don't recover: resume with a lower `--lr`, e.g. 4e-4. Resuming applies the new learning rate.
-- **Snapshots** every 10,000 steps (5,000 in stage 2) keep fallback points, named by bits per byte.
-
-## After training
-
-- **Fact recall:** `python probe.py checkpoints/fwe_d512/best.pt`, and compare with the Wikipedia model. FineWeb-Edu usually helps explanatory text more than fact recall.
-- **Long-context use:** whether the model actually uses all 2,048 tokens is measured by the length evaluation in phase 1 of [long_context_plan.md](long_context_plan.md).
-- **Chat:** `finetune.py --base checkpoints/fwe_d512/best.pt`. It takes the block size from the base checkpoint, so fine-tuning keeps the 2048 window. See [chat.md](chat.md).
-- **Recurrent inference:** with the sliding window, the state grows with the window. At D=512 with a 2048-token window, it's about 4GB: about 0.8GB for S, about 3.2GB for the ring buffer. Saved state files are that size too. Speed per token stays constant. See [recurrent.md](recurrent.md).
-
-## Variants
-
-| | Quick | **This recipe** | Larger |
-|---|---|---|---|
-| `--n-embd` | 256 | **512** | 768 |
-| Vocabulary | 16384 | **32768** | 32768 |
-| Parameters | about 34M | **about 134M** | about 276M |
-| Shards | 1 | **4** | 7–8 |
-| Tokens | about 0.65B | **about 2.3B** | about 5B |
-| `--batch-size` / `--grad-accum` (512 tokens) | 64 / 2 | **64 / 4** | 64 / 8 |
-| Steps | 20,000 | **60,000 + 10,000** | 150,000 (e.g. 130,000 + 20,000) |
-| `--lr` | 1e-3 | **6e-4** | 4e-4 |
-| Estimated H100 time | about 1.5 h at 512 | **about 14–18 h** | about 3 days |
-
-**Quick variant**, at 512 tokens only. It matches the Wikipedia model's size, so comparing the two shows the effect of the data alone:
+### Commands
 
 ```
 python prepare_data.py fineweb-edu --tokenizer sentencepiece --vocab-size 16384
@@ -128,8 +51,308 @@ python train.py --data-dir data/fineweb-edu_sp16384 --ckpt-dir checkpoints/fwe_d
     --eval-freq 1000 --snapshot-freq 5000
 ```
 
-**Longer windows.** For 4K–8K tokens, continue from stage 2 with `--block-size 4096` (then 8192), `--attn-chunk 256`, and a `--batch-size` that keeps 32K tokens per step. Chunked attention keeps the attention cost growing linearly. That's phase 5 of [long_context_plan.md](long_context_plan.md).
+One shard is the default, so the folder name has no `_1shards` suffix. On an 80GB GPU, `--grad-accum 1` probably fits too, and is a little faster.
 
-## What to expect
+### Results
+
+On an H100:
+
+| | |
+|---|---|
+| Speed | A steady 172K tokens/s, 190 ms per step: **about 64 minutes** for 20,000 steps |
+| Validation | **1.1739 bpb at step 20,000** (1.2136 at step 13,000). It fell faster over the last few thousand steps, as the learning rate decayed. Training loss matched validation, so no overfitting |
+| Bytes per token | About 3.9 |
+
+**Fact recall** (`probe.py`, 50 probes, greedy), against the Wikipedia model of the same size:
+
+| Checkpoint | Data | Tokens trained | Probe score |
+|---|---|---|---|
+| `fwe_d256/best.pt`, step 20,000 (final) | FineWeb-Edu, 1 shard | about 655M | **14/50 (28%)** |
+| `fwe_d256/best.pt`, step 15,000 | FineWeb-Edu, 1 shard | about 490M | 9/50 (18%) |
+| `wiki_sp16384/best.pt`, step 40,000 | Wikipedia, 2 shards | about 655M | 6/50 (12%) |
+
+**What the results show:**
+- **FineWeb-Edu is ahead,** 14 against 6 with the same model size and tokens. Scores move by up to about 5 between nearby checkpoints (see the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe)), so treat this as likely rather than certain. A likely reason is repetition: small models learn a fact only after seeing it many times. Educational pages restate common knowledge constantly, while Wikipedia mostly states each fact once.
+- **The last 5,000 steps added 5 facts** (9 to 14), while the learning rate decayed from about 3e-4 to 1e-4. That would fit the annealing effect, where a model consolidates what it learned as the rate drops. But 4,000 more steps on the same data later lost 5 again (see the experiment), so this is within the probe's noise.
+- **It knows the most-repeated facts:** major dates (1914, 1945, 1789), London and Rome as capitals, water and oxygen, the Earth orbiting the Sun, Darwin and evolution. It missed rarer ones: 1492, 1776, birth years, chemical symbols, currencies.
+- **Direction matters:** "The capital of France is" gives Paris, but "Paris is the capital of" gives Croatia, and the same for Japan and Tokyo. Language models often learn a fact only in the direction it's usually written ("the reversal curse", Berglund et al., 2023).
+- **The Wikipedia model learned Wikipedia's templates:** its answers ("the municipality of…", "the province of…") copy the many short articles about small places. It learned the format more than the facts.
+- **Text quality:** with `--top-k 20 --temperature 0.8`, fluent, article-like text with headings, but it drifts off topic ("Photosynthesis is the process" turned into an article about diet). A 34M model learns grammar and style before meaning.
+
+---
+
+## Experiment: a Wikipedia phase on the quick recipe
+
+Status: **round 1 done (inconclusive), round 2 running.**
+
+**Question:** does a final training phase on a mix of FineWeb-Edu and Wikipedia add facts, beyond what extra training on FineWeb-Edu alone would? It's a cheap test of the [optional Wikipedia mix in recipe 2's stage 2](#option-stage-2-with-wikipedia), and the first real run of dataset mixing in `train.py`.
+
+### Design
+
+Both arms continue recipe 1's finished model from step 20,000 to **step 30,000**, with the same settings. Only the data differs:
+
+| Arm | Data | Checkpoint folder |
+|---|---|---|
+| **Mix** | 50% FineWeb-Edu, 50% Wikipedia | `checkpoints/fwe_d256_mix`, starting from a copy of the base checkpoint |
+| **Control** | FineWeb-Edu only | `checkpoints/fwe_d256`: the base run itself, continued |
+
+- **Why a control:** 10,000 more steps adds about 330M tokens. Any gain could come from the extra training alone. The difference between the arms is the effect of Wikipedia.
+- **Wikipedia tokens:** the mix arm draws about 165M, less than one pass over 2 shards.
+- **The base checkpoint is kept as a snapshot:** continuing `fwe_d256` overwrites its `latest.pt`, and its `best.pt` whenever validation improves. Recipe 1's final model stays available as `checkpoints/fwe_d256/step0020000_bpb1.1734.pt`.
+- **No warmup on resume:** `train.py` computes the learning rate from the step number, and warmup only covers the first `--warmup-iters` steps of the whole run. A resumed run jumps straight to the cosine value for its `--max-iters`. The optimizer state is restored, so the jump is tolerable.
+- **The arms' learning-rate paths differ.** Both end at 1e-4 at step 30,000, but the mix arm ran in two parts, and the control in one:
+
+  | Arm | Steps 20,000–24,000 | Steps 24,000–30,000 |
+  |---|---|---|
+  | Mix | Jumps to about 1.7e-4, decays to 1e-4 (round 1, `--max-iters 24000`) | Jumps to about 1.9e-4, decays to 1e-4 (round 2, `--max-iters 30000`) |
+  | Control | Jumps to about 3.4e-4, then decays to 1e-4 by step 30,000 in one run | |
+
+  The control trains at higher rates for longer. Keep that in mind when comparing: part of any difference may come from the schedule, not the data.
+
+### Commands
+
+**1. Prepare Wikipedia with recipe 1's tokenizer.** Datasets in a mix must share one tokenizer:
+
+```
+python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece \
+    --tokenizer-model data/fineweb-edu_sp16384/tokenizer.model --name wikipedia_2shards_fwe16k
+```
+
+**2. Start the mix arm from a copy of the base checkpoint:**
+
+```
+mkdir -p checkpoints/fwe_d256_mix
+cp checkpoints/fwe_d256/latest.pt checkpoints/fwe_d256_mix/latest.pt
+```
+
+**3. Mix arm**, to step 30,000. Round 1 ran this with `--max-iters 24000` first; round 2 resumes from there:
+
+```
+python train.py --data-dir data/fineweb-edu_sp16384 data/wikipedia_2shards_fwe16k \
+    --data-weights 0.5 0.5 --reset-best --ckpt-dir checkpoints/fwe_d256_mix \
+    --n-embd 256 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
+    --block-size 512 --batch-size 64 --grad-accum 2 \
+    --max-iters 30000 --lr 1e-3 --warmup-iters 1000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000
+```
+
+`--reset-best` makes the mix arm's `best.pt` follow its own validation, which measures the mix.
+
+**4. Control arm:** continue the base run to step 30,000:
+
+```
+python train.py --data-dir data/fineweb-edu_sp16384 --ckpt-dir checkpoints/fwe_d256 \
+    --n-embd 256 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
+    --block-size 512 --batch-size 64 --grad-accum 2 \
+    --max-iters 30000 --lr 1e-3 --warmup-iters 1000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000
+```
+
+**5. Compare** the base model and several checkpoints per arm:
+
+```
+python probe.py checkpoints/fwe_d256/step0020000_bpb1.1734.pt \
+    checkpoints/fwe_d256/step0025000_*.pt checkpoints/fwe_d256_mix/step0025000_*.pt \
+    checkpoints/fwe_d256/latest.pt checkpoints/fwe_d256_mix/latest.pt --verbose
+```
+
+Probing step 25,000 as well as 30,000 shows how much the score moves between nearby checkpoints of the same arm, a rough measure of probe noise.
+
+### What to look at
+
+| Measure | Where | What it tells you |
+|---|---|---|
+| Probe score, mix vs. control | `probe.py` | **The main result:** facts added by Wikipedia beyond extra training |
+| Probe score, step 25,000 vs. 30,000 within each arm | `probe.py` | How noisy the probe is. A difference between the arms smaller than this means nothing |
+| FineWeb-Edu validation bpb, mix vs. control | Each arm's eval lines (the mix arm prints one line per dataset) | The cost: how much general text quality the mix gives up. Both arms use the same validation batches, so the numbers compare directly. Also the low-noise check of whether the control improved |
+| Wikipedia validation bpb | The mix arm's eval lines | Whether the model adapts to Wikipedia; it should fall steadily |
+| Which facts changed | `--verbose` output | Whether Wikipedia adds rarer facts, or only shifts which borderline ones are right |
+
+### Deciding
+
+With 50 probes, differences of up to about 3 facts are within noise, and round 1 suggests the noise between checkpoints may be larger (see below).
+
+| Outcome | For recipe 2 |
+|---|---|
+| Mix beats control by **4 or more** facts at both steps 25,000 and 30,000, with FineWeb-Edu bpb at most about 0.01 worse | Use the Wikipedia mix in stage 2 |
+| Within **3 facts**, or inconsistent between steps | No clear effect at this scale. Keep stage 2 on FineWeb-Edu only, or use a smaller share such as 25% Wikipedia |
+| Mix **worse** than control | Keep stage 2 on FineWeb-Edu only |
+
+A 34M model has little spare capacity, so new facts may displace old ones. A null result here doesn't rule out a gain at 134M.
+
+### Experiment results
+
+**Round 1** (4,000 steps, to step 24,000). The control ran in a separate copy, `fwe_d256_cont`, which round 2 no longer needs:
+
+| Checkpoint | Probe score | FineWeb-Edu val bpb | Wikipedia val bpb |
+|---|---|---|---|
+| Base, step 20,000 | 14/50 | 1.1739 | – |
+| Control, step 24,000 | 9/50 | not recorded | – |
+| Mix, step 24,000 | 12/50 | not recorded | not recorded |
+
+**Reading round 1:**
+- **Both arms fell below the base model,** the control by 5 facts with no change of data. That points to probe noise rather than either data choice: many facts sit right at the edge (the correct answer only slightly more likely than a wrong one), so small weight changes flip them. Small models also keep forgetting and relearning rarely seen facts as training continues ("forgetting events", Toneva et al., 2019).
+- **Mix against control, 12 against 9,** is within noise: no evidence for or against Wikipedia.
+- **4,000 steps was short for Wikipedia to add facts:** the mix arm saw about 65M Wikipedia tokens, so most facts in it appeared once or not at all. Round 2 extends both arms to 10,000 steps.
+
+**Round 2** (to step 30,000). The control rows are still to be filled in:
+
+| Checkpoint | Probe score | FineWeb-Edu val bpb | Wikipedia val bpb |
+|---|---|---|---|
+| Control, step 25,000 | | | – |
+| Mix, step 25,000 | 10/50 | not recorded | not recorded |
+| Control, step 30,000 | | | – |
+| Mix, step 30,000 | 11/50 | 1.1745 | 1.2127 |
+
+---
+
+## Recipe 2: Standard (D=512, 2048-token context)
+
+A D=512 model of about 134M parameters, trained on about 2.3B tokens in two stages, ending with a **2048-token context window**.
+
+Status: **planned.** Times are estimates scaled from recipe 1's measured speed, not measurements. Check them before committing to the full run (see [Before the long run](#before-the-long-run)).
+
+### The method
+
+1. **Stage 1: train at 512 tokens** for about 85% of the steps. Short blocks are cheap, and the model learns the language there.
+2. **Stage 2: continue at 2048 tokens** for the last 15%, while the learning rate decays. The model learns to use the longer context. Optionally, stage 2 also mixes in Wikipedia, depending on the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe).
+
+Most long-context models are trained this way. Training at 2048 from the start works too, but costs much more for little gain:
+
+| Block size | Training cost per token (512 = 1×) | 2.3B tokens, all at this length |
+|---|---|---|
+| 512 | 1× | about 12–16 h |
+| 1024 | about 1.25× | about 15–20 h |
+| 2048 | about 1.75× | about 21–28 h |
+| 2048 with `--attn-chunk 256` | about 1.4× | about 17–22 h |
+| **This recipe: 60K steps at 512, then 10K at 2048 with `--attn-chunk 256`** | | **about 14–17 h** |
+
+Attention cost grows with block length; the rest of the model's cost doesn't. At D=512, attention is about a quarter of the cost at 512 tokens, and more than half at 2048. [Chunked attention](train.md#chunked-attention-for-long-blocks---attn-chunk) (`--attn-chunk`) computes the same model with a cost that grows linearly with block length. At D=512 it pays off above about 1,300 tokens, so it's used in stage 2 only.
+
+### Settings
+
+| Setting | Stage 1 | Stage 2 | Why |
+|---|---|---|---|
+| `--n-embd` | 512 | 512 | 4× recipe 1's size, and still overnight on one H100 |
+| Vocabulary | 32768 | 32768 | Web text is varied, so a larger vocabulary puts more text in each token, and each block holds more context. The extra embedding parameters are cheap at D=512 |
+| Parameters | about 134M | | 3 · 128 · 512² + 2 · 32768 · 512 |
+| `--block-size` | 512 | 2048 | |
+| `--batch-size` | 64 | 16 | 32K tokens per step in both stages |
+| `--grad-accum` | 4 | 4 | BDH's sparse activations are large, so a full batch doesn't fit in 80GB. Micro-batches are 8K tokens in both stages |
+| `--attn-chunk` | off | 256 | Faster only above about 1,300 tokens at D=512 |
+| Steps | 0–60,000 | 60,000–70,000 | About 2.3B tokens in total, close to 20 tokens per parameter |
+| `--lr` | 6e-4 | 6e-4 | Lower than D=256's 1e-3: larger models are less stable at the same rate |
+| `--warmup-iters` | 2000 | 2000 | |
+
+### Commands
+
+**1. Prepare the data:** 4 shards, about 2.8B tokens, with a new 32K-vocabulary tokenizer:
+
+```
+python prepare_data.py fineweb-edu --shards 4 --tokenizer sentencepiece --vocab-size 32768
+```
+
+Check the folder name it prints; the commands below assume `data/fineweb-edu_4shards_sp32768`.
+
+**2. Stage 1:** 60,000 steps at 512 tokens:
+
+```
+python train.py --data-dir data/fineweb-edu_4shards_sp32768 --ckpt-dir checkpoints/fwe_d512 \
+    --n-embd 512 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
+    --block-size 512 --batch-size 64 --grad-accum 4 \
+    --max-iters 60000 --lr 6e-4 --warmup-iters 2000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 10000
+```
+
+**3. Stage 2:** resume, and continue to 70,000 steps at 2048 tokens:
+
+```
+python train.py --data-dir data/fineweb-edu_4shards_sp32768 --ckpt-dir checkpoints/fwe_d512 \
+    --n-embd 512 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
+    --block-size 2048 --batch-size 16 --grad-accum 4 --attn-chunk 256 \
+    --max-iters 70000 --lr 6e-4 --warmup-iters 2000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000 --reset-best
+```
+
+It resumes from `checkpoints/fwe_d512/latest.pt` at step 60,000. Keep the step-60,000 snapshot from stage 1 for comparisons.
+
+#### Option: stage 2 with Wikipedia
+
+Use this **instead of** the stage 2 command above if the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) shows a gain. Wikipedia is knowledge-dense, and mixing it in while the learning rate decays can improve fact recall (see [Improving fact recall](#improving-fact-recall)).
+
+Prepare Wikipedia with this recipe's tokenizer, any time before stage 2:
+
+```
+python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece \
+    --tokenizer-model data/fineweb-edu_4shards_sp32768/tokenizer.model --name wikipedia_2shards_fwe
+```
+
+Stage 2 with a 50/50 mix:
+
+```
+python train.py --data-dir data/fineweb-edu_4shards_sp32768 data/wikipedia_2shards_fwe \
+    --data-weights 0.5 0.5 --ckpt-dir checkpoints/fwe_d512 \
+    --n-embd 512 --n-head 4 --mlp-mult 128 --n-layer 6 --dropout 0.0 \
+    --block-size 2048 --batch-size 16 --grad-accum 4 --attn-chunk 256 \
+    --max-iters 70000 --lr 6e-4 --warmup-iters 2000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000 --reset-best
+```
+
+- **Repetition:** stage 2 draws about 165M Wikipedia tokens, less than one pass over 2 shards.
+- **Evaluation takes about twice as long,** because each dataset is evaluated separately. The log shows both losses, so you can see whether general text suffers while Wikipedia improves.
+
+### What happens at the switch to stage 2
+
+- **Changing the block size on resume works.** `train.py` checks the model options and the tokenizer when it resumes, not the block size. Stage 2 checkpoints record 2048, so `inference.py`, `chat.py` and `finetune.py` use a 2048-token window automatically.
+- **`--reset-best`:** with more context, validation loss is lower, and with a data mix it measures different text. Either way it isn't comparable with stage 1's, so `best.pt` restarts from the first stage-2 evaluation.
+- **The learning rate ticks up slightly.** Stage 1's schedule ends at 6e-5. Stage 2 resumes partway through a 70,000-step schedule, at about 9e-5, and decays back to 6e-5. A small bump like this is harmless.
+- **Memory stays about the same:** micro-batches are 8K tokens in both stages, and with `--attn-chunk`, no `block × block` score matrices are stored.
+- **`--attn-chunk` changes only how attention is computed,** not the model.
+
+### Before the long run
+
+1. **Measure the speed.** Run stage 1 for about 200 steps and read tok/s from the log. Stage 1 hours ≈ 1.97B tokens ÷ tok/s ÷ 3600; stage 2 is about 1.4× slower per token. Stop with Ctrl+C; running the same command again resumes.
+2. **Check memory.** If either stage runs out of memory, double `--grad-accum`. Tokens per step stay the same, so results don't change.
+3. **Check chunked attention on your GPU:** `python test_chunked.py --bench --n-embd 512` checks it against full attention, then times training steps at several block sizes. Use the fastest chunk size at 2048, or drop `--attn-chunk` if full attention is faster.
+4. **Try stage 2 briefly** before the real switch: copy an early `latest.pt` into a scratch `--ckpt-dir` and run the stage 2 command for a few dozen steps.
+
+### During training
+
+- **Validation bpb should still be falling at step 60,000.** If it flattens early, the model is too small for the data; see the larger variant below.
+- **Loss spikes** that don't recover: resume with a lower `--lr`, e.g. 4e-4. Resuming applies the new learning rate.
+- **Snapshots** every 10,000 steps (5,000 in stage 2) keep fallback points, named by bits per byte.
+
+### After training
+
+- **Fact recall:** `python probe.py checkpoints/fwe_d512/best.pt checkpoints/fwe_d256/best.pt --verbose`.
+- **Long-context use:** whether the model actually uses all 2,048 tokens is measured by the length evaluation in phase 1 of [long_context_plan.md](long_context_plan.md).
+- **Chat:** `finetune.py --base checkpoints/fwe_d512/best.pt`. It takes the block size from the base checkpoint, so fine-tuning keeps the 2048 window. See [chat.md](chat.md).
+- **Recurrent inference:** with the sliding window, the state grows with the window. At D=512 with 2048 tokens, it's about 4GB: about 0.8GB for S and about 3.2GB for the ring buffer. Saved state files are that size too. Speed per token stays constant. See [recurrent.md](recurrent.md).
+
+### Extensions
+
+- **Longer windows:** for 4K–8K tokens, continue from stage 2 with `--block-size 4096` (then 8192), `--attn-chunk 256`, and `--batch-size 8` (then 4) to keep 32K tokens per step. Chunked attention keeps the attention cost growing linearly. That's phase 5 of [long_context_plan.md](long_context_plan.md).
+- **Larger variant:** `--n-embd 768` (about 276M parameters), 7–8 shards (about 5B tokens), `--grad-accum 8` at 512 tokens, `--lr 4e-4`, and 150,000 steps, e.g. 130,000 at 512 then 20,000 at 2048. About 3 days on an H100 (estimate). Otherwise the same commands.
+
+### What to expect
 
 A 134M-parameter model gives fluent, on-topic educational prose and some basic facts. It won't give reliable answers or multi-step reasoning: those need much larger models and more data.
+
+---
+
+## Improving fact recall
+
+How to make a model remember more facts, as measured by `probe.py`, roughly in order of impact. The findings on knowledge capacity come from studies of transformers (Allen-Zhu & Li, "Physics of Language Models", part 3); they're not measured for BDH.
+
+1. **A larger model: the biggest lever.** Language models store at most about **2 bits of knowledge per parameter**, and they spend capacity on grammar and style first. A 34M model has room for only a limited number of facts; recipe 2's 134M model has about 4× the room.
+2. **More exposures per fact.** A model needs on the order of **hundreds of exposures** to a fact to store it near that capacity.
+   - **Train well past 20 tokens per parameter.** 20 is the compute-optimal point for loss, not for knowledge, which keeps improving with longer training. Small open models are trained on 100–1000+ tokens per parameter.
+   - **Repeating knowledge-dense data is fine:** 2–4 passes over Wikipedia cost little compared with fresh data.
+   - **Data that restates common facts helps small models,** a likely reason FineWeb-Edu beat Wikipedia in recipe 1.
+3. **A better data mix.**
+   - **Mix general text with knowledge-dense text,** e.g. FineWeb-Edu with Wikipedia: FineWeb-Edu repeats common facts, and Wikipedia covers many more. `train.py --data-dir A B --data-weights 0.5 0.5`; see [Mixing datasets](train.md#mixing-datasets).
+   - **Anneal on knowledge-dense data:** spend the last 10–20% of training, while the learning rate decays, mostly on high-quality text such as Wikipedia. Recent small models are trained this way. Recipe 1's probe scores were too noisy to confirm this at 34M parameters.
+   - **The same fact in several phrasings** helps a model retrieve it from different prompts. Facts seen in one wording or one direction are often stored but hard to retrieve.
+4. **Chat fine-tuning (small effect).** `finetune.py` teaches the model to answer rather than continue text. It helps express facts the model already knows, but doesn't add new ones.
+5. **Changes to the probe: better measurement, not more knowledge.** Few-shot prompts (two or three solved examples before each question) and multiple-choice scoring (the likelihood of the right answer against wrong ones) usually raise scores and detect partial knowledge. Neither is implemented in `probe.py` yet; keep the current probe as the baseline whatever is added.
+6. **Retrieval, for reliable facts in practice.** Put the relevant passage in the model's context instead of relying on its memory. Even small models answer well when the answer is in front of them. That measures reading, not memory, so it's a different score.

@@ -13,8 +13,30 @@ python train.py [options]
 | Default: `input.txt` (Tiny Shakespeare, downloaded if missing) | bytes | The last 10% of the file |
 | `--data FILE`: any text file | bytes | The last 10% of the file |
 | `--data-dir DIR`: a folder made by `prepare_data.py` | from `meta.json` | `val.bin` |
+| `--data-dir DIR1 DIR2 ...`: several folders, mixed | shared, from `meta.json` | each folder's `val.bin` |
 
 With `--data-dir`, the tokenizer, vocab size and data type all come from the dataset's `meta.json`, so there's nothing else to set.
+
+### Mixing datasets
+
+```
+python train.py --data-dir data/fineweb-edu_4shards_sp32768 data/wikipedia_2shards_fwe \
+    --data-weights 0.5 0.5 ...
+```
+
+- **Sampling:** each training sequence comes from one dataset, drawn by its weight. Every micro-batch mixes them, so each step sees roughly the requested shares. `--data-weights` is normalized, so `1 1` and `0.5 0.5` are the same.
+- **Default weights:** in proportion to each dataset's training tokens, the same as concatenating them.
+- **One tokenizer:** all datasets in a mix must use the same tokenizer, since the model has one vocabulary. Prepare the extra datasets with the first one's tokenizer model; `train.py` refuses a mix with different tokenizers. `--name` keeps the folder name readable:
+
+  ```
+  python prepare_data.py wikipedia --shards 2 --tokenizer sentencepiece \
+      --tokenizer-model data/fineweb-edu_4shards_sp32768/tokenizer.model --name wikipedia_2shards_fwe
+  ```
+
+- **Validation:** each dataset is evaluated separately on its own `val.bin`, with `--eval-iters` batches each, so evaluation takes proportionally longer. The log shows each dataset's loss and bpb, then the **mix**: the average weighted by `--data-weights`. `best.pt` follows the mix.
+- **bpb of the mix** uses the weighted average bytes per token, so it's total bits over total bytes of the mixed text.
+- **Repetition:** a small dataset with a large weight is repeated more often. Sequences start at random positions, so the number of passes over a dataset is about `weight × tokens trained ÷ its training tokens`. Up to about 4 passes is generally fine.
+- **Changing the mix when resuming** works: the weights and datasets come from the command line, not the checkpoint. The validation loss then measures something different, so add `--reset-best` (see below).
 
 ## Options
 
@@ -35,7 +57,8 @@ With `--data-dir`, the tokenizer, vocab size and data type all come from the dat
 | `--seed N` | 1337 | Random seed. Ignored when resuming, because the saved random state is restored |
 | `--compile` / `--no-compile` | on | Use `torch.compile`. Turn it off if it fails, which is common on Windows without Triton |
 | `--data FILE` | `input.txt` | Plain text training file, read as bytes; ignored when `--data-dir` is set |
-| `--data-dir DIR` | none | Dataset folder made by `prepare_data.py` |
+| `--data-dir DIR ...` | none | Dataset folder made by `prepare_data.py`. Several folders are mixed; see [Mixing datasets](#mixing-datasets) |
+| `--data-weights W ...` | by training tokens | With several `--data-dir`: share of training sequences from each, normalized to sum to 1 |
 
 ### Model
 
@@ -64,7 +87,8 @@ The parameter count is about `3 × 128 × D² + 2 × vocab × D` at the default 
 | Option | Default | Description |
 |---|---|---|
 | `--eval-freq N` | 500 | Evaluate on the validation split every N steps and at the end. Saves `<ckpt-dir>/best.pt` whenever validation loss improves. `0` turns this off |
-| `--eval-iters N` | 50 | Validation batches averaged per evaluation. With the defaults that's 50 × 32 × 512 = about 820K tokens |
+| `--eval-iters N` | 50 | Validation batches averaged per evaluation, per dataset when mixing. With the defaults that's 50 × 32 × 512 = about 820K tokens |
+| `--reset-best` | off | When resuming, forget the best validation loss so far, so `best.pt` restarts from the next evaluation. Use it after changing what validation measures: the data mix, or the block size. Otherwise a new validation loss that's higher for that reason never replaces `best.pt` |
 
 ### Sample after training
 
@@ -93,15 +117,23 @@ Eval step 2500: val loss 1.6601 (2.3951 bpb) | best 1.6543 (2.3867 bpb)
 
 - **val loss and bpb:** measured on the validation split with dropout off, so they're the numbers to compare runs by.
 - **The same batches each time:** every evaluation uses the same validation batches (a fixed seed), so changes between evaluations reflect the model, not which batches were drawn.
+- **With several datasets,** each one's validation loss is printed first, then the mix:
+
+  ```
+    fineweb-edu_4shards_sp32768: val loss 3.1052 (1.1376 bpb)
+    wikipedia_2shards_fwe: val loss 2.8817 (1.0011 bpb)
+  Eval step 62000: val loss 2.9935 (1.0659 bpb) | new best
+  ```
+
 - **Overfitting:** training loss still falling while validation loss rises means the model is memorizing. That's common on Tiny Shakespeare.
 
 ## Checkpoints, resuming and snapshots
 
-- **What a checkpoint contains:** the weights, optimizer and gradient-scaler state, the step, the model config, the tokenizer, `block_size`, the best validation loss so far and the random-number state. Every save writes a temp file first, so an interrupted save can't corrupt `latest.pt`.
+- **What a checkpoint contains:** the weights, optimizer and gradient-scaler state, the step, the model config, the tokenizer, `block_size`, the datasets and their mix weights (for the record), the best validation loss so far and the random-number state. Every save writes a temp file first, so an interrupted save can't corrupt `latest.pt`.
 - **`best.pt`** is the checkpoint with the lowest validation loss so far, saved at evaluation time. It's usually the one to use with `inference.py --checkpoint`, especially if later training overfits. A resumed run remembers the best validation loss, so `best.pt` is only replaced by something better.
 - **Ctrl+C** saves `latest.pt` before exiting. Run the same command again to continue.
 - **What resuming requires:** the same model options (`--n-layer`, `--n-embd`, `--n-head`, `--dropout`, `--mlp-mult`) and the same tokenizer. Otherwise it stops with an error; use a new `--ckpt-dir` or `--no-resume`.
-- **Options you can change when resuming:** `--lr`, `--min-lr`, `--weight-decay`, `--batch-size`, `--block-size`, `--attn-chunk` and `--max-iters`. The learning rate is recomputed from the step number. Changing `--max-iters` reshapes the rest of the schedule, and the rate can jump back up.
+- **Options you can change when resuming:** `--lr`, `--min-lr`, `--weight-decay`, `--batch-size`, `--block-size`, `--attn-chunk`, `--data-dir` and `--data-weights` (with the same tokenizer), and `--max-iters`. The learning rate is recomputed from the step number. Changing `--max-iters` reshapes the rest of the schedule, and the rate can jump back up.
 - **Snapshots** are full checkpoints. Resume from one by copying it over `latest.pt`, or use it directly with `inference.py --checkpoint`. Each snapshot is about 3× the size of the weights, because it includes AdamW's state: about 290MB for the default model. Nothing deletes old snapshots automatically.
 
 ## Recipes

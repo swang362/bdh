@@ -15,7 +15,7 @@ This folder documents the command-line scripts for training and running BDH mode
 
 Each script also prints its full option list with `--help`.
 
-For measured results, see [benchmarks.md](benchmarks.md). For a full training recipe with a 2048-token window, see [fineweb-edu-train.md](fineweb-edu-train.md).
+For measured results, see [benchmarks.md](benchmarks.md). For complete training recipes on FineWeb-Edu (a quick one-hour model, and a 2048-token-context model), see [fineweb-edu-train.md](fineweb-edu-train.md).
 
 ## Setup
 

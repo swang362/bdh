@@ -67,10 +67,12 @@ RESUME = True  # resume from CKPT_PATH if it exists
 
 DEFAULT_INPUT_PATH = os.path.join(os.path.dirname(__file__), "input.txt")
 input_file_path = DEFAULT_INPUT_PATH
-data_dir = None  # directory with train.bin / val.bin from prepare_data.py
+# datasets from prepare_data.py (--data-dir), each a dict with dir, name, dtype,
+# weight (share of training sequences, summing to 1) and bytes_per_token;
+# empty when training on a plain text file (--data)
+DATASETS = []
 TOKENIZER = tokenizers.ByteTokenizer()  # replaced by the data dir's tokenizer, see __main__
-DATA_DTYPE = np.uint8  # dtype of the token ids in train.bin / val.bin
-BYTES_PER_TOKEN = 1.0  # average text bytes per token, for reporting bits per byte
+BYTES_PER_TOKEN = 1.0  # average text bytes per token (of the mix), for reporting bits per byte
 
 
 def parse_args():
@@ -122,8 +124,18 @@ def parse_args():
     )
     g.add_argument(
         "--data-dir",
+        nargs="+",
         default=None,
-        help="directory with train.bin / val.bin made by prepare_data.py",
+        help="directory with train.bin / val.bin made by prepare_data.py; several directories "
+        "are mixed (they must share one tokenizer, see --data-weights)",
+    )
+    g.add_argument(
+        "--data-weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help="with several --data-dir: share of training sequences from each, normalized to sum "
+        "to 1, e.g. 0.5 0.5. Default: in proportion to their training tokens",
     )
     g = p.add_argument_group("model")
     g.add_argument("--n-layer", type=int, default=d.n_layer, help="number of layers (weights are shared across layers)")
@@ -154,7 +166,13 @@ def parse_args():
         default=EVAL_FREQ,
         help="evaluate on the validation split every N steps (and at the end), saving <ckpt-dir>/best.pt on improvement; 0 disables",
     )
-    g.add_argument("--eval-iters", type=int, default=EVAL_ITERS, help="validation batches averaged per evaluation")
+    g.add_argument("--eval-iters", type=int, default=EVAL_ITERS, help="validation batches averaged per evaluation (per dataset when mixing)")
+    g.add_argument(
+        "--reset-best",
+        action="store_true",
+        help="when resuming, forget the best validation loss so far, so best.pt restarts from the next "
+        "evaluation. Use it after changing what the validation loss measures (the data mix or block size)",
+    )
     g = p.add_argument_group("sample after training")
     g.add_argument("--prompt", default="To be or ", help="prompt for the sample generated after training")
     g.add_argument("--sample-tokens", type=int, default=100, help="number of tokens to generate (0 to skip sampling)")
@@ -171,9 +189,15 @@ def fetch_data():
             f.write(requests.get(data_url).text)
 
 
-def get_batch(split, generator=None):
-    if data_dir is not None:
-        data = np.memmap(os.path.join(data_dir, f"{split}.bin"), dtype=DATA_DTYPE, mode="r")
+def get_batch(split, generator=None, dataset=None):
+    """A micro-batch of random sequences. With several datasets, each sequence comes
+    from a dataset drawn by its weight; dataset= takes all of them from one dataset."""
+    if DATASETS:
+        datasets = DATASETS if dataset is None else [dataset]
+        arrays = [
+            np.memmap(os.path.join(d["dir"], f"{split}.bin"), dtype=d["dtype"], mode="r")
+            for d in datasets
+        ]
     else:
         # plain text file: treat the file as bytes
         data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
@@ -181,14 +205,22 @@ def get_batch(split, generator=None):
             data = data[: int(0.9 * len(data))]
         else:
             data = data[int(0.9 * len(data)) :]
-    ix = torch.randint(len(data) - BLOCK_SIZE, (MICRO_BATCH_SIZE,), generator=generator)
+        arrays = [data]
+    if len(arrays) == 1:
+        sources = arrays * MICRO_BATCH_SIZE
+        ix = torch.randint(len(arrays[0]) - BLOCK_SIZE, (MICRO_BATCH_SIZE,), generator=generator).tolist()
+    else:
+        weights = torch.tensor([d["weight"] for d in datasets])
+        which = torch.multinomial(weights, MICRO_BATCH_SIZE, replacement=True, generator=generator)
+        sources = [arrays[w] for w in which.tolist()]
+        ix = [torch.randint(len(a) - BLOCK_SIZE, (1,), generator=generator).item() for a in sources]
     x = torch.stack(
-        [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
+        [torch.from_numpy((a[i : i + BLOCK_SIZE]).astype(np.int64)) for a, i in zip(sources, ix)]
     )
     y = torch.stack(
         [
-            torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64))
-            for i in ix
+            torch.from_numpy((a[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64))
+            for a, i in zip(sources, ix)
         ]
     )
     if torch.cuda.is_available():
@@ -213,6 +245,8 @@ def save_checkpoint(model, optimizer, step, path=None):
         "config": dataclasses.asdict(BDH_CONFIG),
         "block_size": BLOCK_SIZE,  # training context length, used by inference.py
         "tokenizer": tokenizers.to_state(TOKENIZER),
+        # training data, for the record: directories and their mix weights
+        "data": [{"dir": d["dir"], "weight": d["weight"]} for d in DATASETS],
         "best_val_loss": best_val_loss,  # so a resumed run keeps improving on the same best
         "rng_cpu": torch.get_rng_state(),
         "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
@@ -286,43 +320,85 @@ def sync():
 
 @torch.no_grad()
 def evaluate(model):
-    """Average loss over EVAL_ITERS validation batches, with dropout off."""
-    # a fixed seed gives the same validation batches every time, so evaluations are
-    # comparable with each other, and the training RNG stream is left untouched
-    generator = torch.Generator().manual_seed(0)
+    """Average loss over EVAL_ITERS validation batches, with dropout off.
+
+    Returns (loss, per_dataset). With several datasets, each one is evaluated
+    separately, per_dataset lists their losses, and loss is their weighted average,
+    i.e. the loss on the training mix. Otherwise per_dataset is None."""
     model.eval()
-    total = 0.0
     # batches are micro-batches, so run GRAD_ACCUM times as many to cover the same tokens
     n_batches = EVAL_ITERS * GRAD_ACCUM
-    for _ in range(n_batches):
-        x, y = get_batch("val", generator=generator)
-        with ctx:
-            _, loss = model(x, y)
-        total += loss.item()
+    losses = []
+    for dataset in DATASETS if len(DATASETS) > 1 else [None]:
+        # a fixed seed gives the same validation batches every time, so evaluations are
+        # comparable with each other, and the training RNG stream is left untouched
+        generator = torch.Generator().manual_seed(0)
+        total = 0.0
+        for _ in range(n_batches):
+            x, y = get_batch("val", generator=generator, dataset=dataset)
+            with ctx:
+                _, loss = model(x, y)
+            total += loss.item()
+        losses.append(total / n_batches)
     model.train()
-    return total / n_batches
+    if len(losses) == 1:
+        return losses[0], None
+    return sum(d["weight"] * l for d, l in zip(DATASETS, losses)), losses
 
 
 if __name__ == "__main__":
     args = parse_args()
     # override the module-level configuration used by the functions above
     input_file_path = args.data
-    data_dir = args.data_dir
-    if data_dir is None:
+    if not args.data_dir:
+        if args.data_weights:
+            raise SystemExit("--data-weights needs --data-dir")
         fetch_data()
     else:
-        for split in ("train", "val"):
-            path = os.path.join(data_dir, f"{split}.bin")
-            if not os.path.exists(path):
-                raise SystemExit(f"{path} not found (run prepare_data.py first)")
-        meta = tokenizers.load_meta(data_dir)
-        TOKENIZER = tokenizers.from_data_dir(data_dir)
-        DATA_DTYPE = np.dtype(meta.get("dtype", "uint8"))
-        BYTES_PER_TOKEN = meta.get("bytes_per_token", 1.0)
-        print(
-            f"Using dataset {data_dir} ({TOKENIZER.type} tokenizer, "
-            f"vocab {TOKENIZER.vocab_size}, {BYTES_PER_TOKEN:.2f} bytes/token)"
-        )
+        if args.data_weights and len(args.data_weights) != len(args.data_dir):
+            raise SystemExit(
+                f"--data-weights has {len(args.data_weights)} values for {len(args.data_dir)} --data-dir entries"
+            )
+        if args.data_weights and min(args.data_weights) <= 0:
+            raise SystemExit("--data-weights must be positive")
+        for i, data_dir in enumerate(args.data_dir):
+            for split in ("train", "val"):
+                path = os.path.join(data_dir, f"{split}.bin")
+                if not os.path.exists(path):
+                    raise SystemExit(f"{path} not found (run prepare_data.py first)")
+            meta = tokenizers.load_meta(data_dir)
+            tok = tokenizers.from_data_dir(data_dir)
+            if i == 0:
+                TOKENIZER = tok
+            elif not tokenizers.same_tokenizer(tok, TOKENIZER):
+                first = args.data_dir[0]
+                raise SystemExit(
+                    f"{data_dir} uses a different tokenizer than {first}. Datasets in a mix must share one: "
+                    f"prepare it with --tokenizer-model {os.path.join(first, 'tokenizer.model')}"
+                )
+            dtype = np.dtype(meta.get("dtype", "uint8"))
+            n_train = os.path.getsize(os.path.join(data_dir, "train.bin")) // dtype.itemsize
+            DATASETS.append(
+                {
+                    "dir": data_dir,
+                    "name": os.path.basename(os.path.normpath(data_dir)),
+                    "dtype": dtype,
+                    "weight": args.data_weights[i] if args.data_weights else n_train,
+                    "bytes_per_token": meta.get("bytes_per_token", 1.0),
+                    "train_tokens": n_train,
+                }
+            )
+        total_weight = sum(d["weight"] for d in DATASETS)
+        for d in DATASETS:
+            d["weight"] /= total_weight
+        # bits per byte of the mix: total bits over total bytes, weighting by tokens drawn
+        BYTES_PER_TOKEN = sum(d["weight"] * d["bytes_per_token"] for d in DATASETS)
+        print(f"Using {TOKENIZER.type} tokenizer, vocab {TOKENIZER.vocab_size}")
+        for d in DATASETS:
+            print(
+                f"  dataset {d['dir']}: {d['train_tokens']:,} train tokens, {d['bytes_per_token']:.2f} bytes/token"
+                + (f", weight {d['weight']:.3f}" if len(DATASETS) > 1 else "")
+            )
     BDH_CONFIG = bdh.BDHConfig(
         n_layer=args.n_layer,
         n_embd=args.n_embd,
@@ -375,6 +451,9 @@ if __name__ == "__main__":
     start_step = 0
     if RESUME and os.path.exists(CKPT_PATH):
         start_step = load_checkpoint(raw_model, optimizer)
+        if args.reset_best:
+            best_val_loss = float("inf")
+            print("Best validation loss reset: best.pt restarts from the next evaluation")
     model = torch.compile(raw_model) if args.compile else raw_model
 
     x, y = get_batch("train")
@@ -397,7 +476,9 @@ if __name__ == "__main__":
     def run_eval(step):
         # evaluate on the validation split; keep best.pt at the lowest validation loss
         global best_val_loss
-        val_loss = evaluate(model)
+        val_loss, per_dataset = evaluate(model)
+        for d, loss in zip(DATASETS, per_dataset or []):
+            print(f"  {d['name']}: val loss {loss:.4f} ({loss / math.log(2) / d['bytes_per_token']:.4f} bpb)")
         val_bpb = val_loss / math.log(2) / BYTES_PER_TOKEN
         improved = val_loss < best_val_loss
         if improved:
