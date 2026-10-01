@@ -6,7 +6,7 @@ import sys
 import time
 from contextlib import nullcontext
 
-import bdh
+import models
 import tokenizer as tokenizers
 import torch
 from recurrent import RecurrentBDH, generate_stream_recurrent, sample_next
@@ -227,8 +227,9 @@ def main():
     if not os.path.exists(args.checkpoint):
         raise SystemExit(f"Checkpoint not found: {args.checkpoint} (run train.py first)")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model = bdh.BDH(bdh.BDHConfig(**checkpoint["config"])).to(device)
-    model.load_state_dict(checkpoint["model"])
+    if args.recurrent and models.arch_of(checkpoint) != "bdh":
+        raise SystemExit("--recurrent needs a BDH checkpoint; this one is " + models.arch_of(checkpoint))
+    model = models.from_checkpoint(checkpoint).to(device)
     model.eval()
     # checkpoints from before tokenizer support have no entry and are byte-level
     tok = tokenizers.from_state(checkpoint.get("tokenizer"))

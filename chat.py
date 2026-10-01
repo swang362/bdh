@@ -17,7 +17,7 @@ import os
 import sys
 from contextlib import nullcontext
 
-import bdh
+import models
 import torch
 
 import chat_format
@@ -66,14 +66,14 @@ def load_model(path, device):
     if not os.path.exists(path):
         raise SystemExit(f"Checkpoint not found: {path} (run finetune.py first)")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    model = bdh.BDH(bdh.BDHConfig(**checkpoint["config"]))
-    model.load_state_dict(checkpoint["model"])
+    model = models.from_checkpoint(checkpoint)
     model.to(device).eval()
     tok = tokenizers.from_state(checkpoint.get("tokenizer"))
     info = {
         "step": checkpoint["step"],
         "block_size": checkpoint.get("block_size", 512),
         "chat": checkpoint.get("chat"),
+        "arch": models.arch_of(checkpoint),
     }
     return model, tok, info
 
@@ -183,6 +183,8 @@ def main():
     ctx = torch.amp.autocast(device_type="cuda", dtype=dtype) if use_cuda else nullcontext()
 
     model, tok, info = load_model(args.checkpoint, device)
+    if args.recurrent and info["arch"] != "bdh":
+        raise SystemExit("--recurrent needs a BDH checkpoint; this one is " + info["arch"])
     context_size = args.context_size if args.context_size is not None else info["block_size"]
     system = args.system if args.system is not None else (info["chat"] or {}).get("system")
     print(

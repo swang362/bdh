@@ -64,13 +64,29 @@ python train.py --data-dir data/fineweb-edu_4shards_sp32768 data/wikipedia_2shar
 
 | Option | Default | Description |
 |---|---|---|
-| `--n-layer N` | 6 | Number of layers. **All layers share the same weights**, so this changes compute, not parameter count |
+| `--arch` | `bdh` | `bdh`, or `gpt`: a transformer baseline for comparisons (see [GPT baseline](#gpt-baseline---arch-gpt)) |
+| `--n-layer N` | 6 | Number of layers. In BDH, **all layers share the same weights**, so this changes compute, not parameter count |
 | `--n-embd D` | 256 | Embedding dimension |
 | `--n-head H` | 4 | Number of heads |
 | `--dropout P` | 0.1 | Dropout rate. Use 0.0 on large datasets trained for under one epoch |
-| `--mlp-mult M` | 128 | Sparse dimension `N = M × D / H` |
+| `--mlp-mult M` | 128 | BDH: sparse dimension `N = M × D / H` |
+| `--mlp-hidden N` | 0 (8/3 × D, rounded up to a multiple of 64) | GPT: hidden size of the SwiGLU MLP |
 
 The parameter count is about `3 × 128 × D² + 2 × vocab × D` at the default `--mlp-mult`. That's 25.3M for the default byte model, and it's printed at startup.
+
+### GPT baseline (`--arch gpt`)
+
+A Llama-style transformer ([gpt.py](../gpt.py)), for comparing BDH with a standard architecture under the same data, tokenizer, schedule and validation: pre-norm with RMSNorm, rotary position embeddings, causal softmax attention (PyTorch's fused `scaled_dot_product_attention`), a SwiGLU MLP, input embeddings tied to the output layer, and no biases.
+
+- **Parameters:** about `vocab × D + layers × 12 × D²`, e.g. 34.1M for 8 layers at D=512 with a 16K vocabulary, the same as a D=256 BDH.
+- **Compute per token:** about 2 × the parameter count, plus attention. BDH does several times more per parameter: its layers share weights, so each weight is used once per layer, and each layer works on a very wide sparse vector. A D=256 BDH does about as much computation per token as a 16-layer, D=1024 GPT (about 220M parameters).
+- **Checkpoints record the architecture,** so `inference.py`, `probe.py`, `chat.py` and `finetune.py` load GPT checkpoints too. `--recurrent` and `--attn-chunk` are BDH-only, and are refused for GPT checkpoints.
+- **Generation re-reads the context window for every token,** like BDH's default method. There's no KV cache yet, so `inference.py` speed isn't a fair comparison of the architectures.
+- **Resuming a checkpoint with a different `--arch` is refused,** like any other model change.
+
+```
+python train.py --arch gpt --n-layer 8 --n-embd 512 --n-head 8 --dropout 0.0 ...
+```
 
 ### Logging and checkpoints
 

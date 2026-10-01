@@ -21,7 +21,7 @@ import re
 import sys
 from contextlib import nullcontext
 
-import bdh
+import models
 import tokenizer as tokenizers
 import torch
 
@@ -147,8 +147,9 @@ def is_correct(completion, answers):
 def probe_checkpoint(path, probes, args, device, ctx):
     # load on CPU: checkpoints also hold optimizer state, which isn't needed here
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    model = bdh.BDH(bdh.BDHConfig(**checkpoint["config"]))
-    model.load_state_dict(checkpoint["model"])
+    if args.recurrent and models.arch_of(checkpoint) != "bdh":
+        raise SystemExit(f"--recurrent needs BDH checkpoints; {path} is {models.arch_of(checkpoint)}")
+    model = models.from_checkpoint(checkpoint)
     model.to(device).eval()
     tok = tokenizers.from_state(checkpoint.get("tokenizer"))
     context_size = args.context_size

@@ -9,6 +9,8 @@ import time
 from contextlib import nullcontext
 
 import bdh
+import gpt
+import models
 import numpy as np
 import tokenizer as tokenizers
 import requests
@@ -43,7 +45,8 @@ print(f"Using device: {device} with dtype {dtype}")
 
 
 # Configuration (defaults; can be overridden from the command line, see parse_args)
-BDH_CONFIG = bdh.BDHConfig()
+ARCH = "bdh"  # model architecture, see models.py
+MODEL_CONFIG = bdh.BDHConfig()
 BLOCK_SIZE = 512
 BATCH_SIZE = 32
 GRAD_ACCUM = 1  # micro-batches per optimizer step; each holds BATCH_SIZE // GRAD_ACCUM sequences
@@ -138,11 +141,23 @@ def parse_args():
         "to 1, e.g. 0.5 0.5. Default: in proportion to their training tokens",
     )
     g = p.add_argument_group("model")
-    g.add_argument("--n-layer", type=int, default=d.n_layer, help="number of layers (weights are shared across layers)")
+    g.add_argument(
+        "--arch",
+        choices=sorted(models.ARCHS),
+        default=ARCH,
+        help="bdh, or gpt: a Llama-style transformer baseline (gpt.py) for comparisons",
+    )
+    g.add_argument("--n-layer", type=int, default=d.n_layer, help="number of layers (BDH shares weights across layers)")
     g.add_argument("--n-embd", type=int, default=d.n_embd, help="embedding dimension D")
     g.add_argument("--n-head", type=int, default=d.n_head, help="number of heads")
     g.add_argument("--dropout", type=float, default=d.dropout, help="dropout rate")
-    g.add_argument("--mlp-mult", type=int, default=d.mlp_internal_dim_multiplier, help="sparse dim N = mlp_mult * n_embd / n_head")
+    g.add_argument("--mlp-mult", type=int, default=d.mlp_internal_dim_multiplier, help="bdh: sparse dim N = mlp_mult * n_embd / n_head")
+    g.add_argument(
+        "--mlp-hidden",
+        type=int,
+        default=0,
+        help="gpt: SwiGLU hidden size; 0 means 8/3 * n_embd, rounded up to a multiple of 64",
+    )
     g = p.add_argument_group("logging and checkpoints")
     g.add_argument("--log-freq", type=int, default=LOG_FREQ, help="log every N steps")
     g.add_argument("--ckpt-freq", type=int, default=CKPT_FREQ, help="save a checkpoint every N steps")
@@ -242,7 +257,8 @@ def save_checkpoint(model, optimizer, step, path=None):
         "optimizer": optimizer.state_dict(),
         "scaler": scaler.state_dict(),
         "step": step,  # number of completed steps, i.e. the next step to run
-        "config": dataclasses.asdict(BDH_CONFIG),
+        "arch": ARCH,
+        "config": dataclasses.asdict(MODEL_CONFIG),
         "block_size": BLOCK_SIZE,  # training context length, used by inference.py
         "tokenizer": tokenizers.to_state(TOKENIZER),
         # training data, for the record: directories and their mix weights
@@ -280,10 +296,15 @@ def load_checkpoint(model, optimizer):
             f"({ckpt_tokenizer.type}, vocab {ckpt_tokenizer.vocab_size}) than the data "
             f"({TOKENIZER.type}, vocab {TOKENIZER.vocab_size}); use another --ckpt-dir or --no-resume"
         )
-    if checkpoint["config"] != dataclasses.asdict(BDH_CONFIG):
+    if models.arch_of(checkpoint) != ARCH:
+        raise ValueError(
+            f"Checkpoint {CKPT_PATH} is a {models.arch_of(checkpoint)} model, not {ARCH}; "
+            "use another --ckpt-dir or --no-resume"
+        )
+    if checkpoint["config"] != dataclasses.asdict(MODEL_CONFIG):
         raise ValueError(
             f"Checkpoint config {checkpoint['config']} does not match "
-            f"current config {dataclasses.asdict(BDH_CONFIG)}"
+            f"current config {dataclasses.asdict(MODEL_CONFIG)}"
         )
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
@@ -399,14 +420,25 @@ if __name__ == "__main__":
                 f"  dataset {d['dir']}: {d['train_tokens']:,} train tokens, {d['bytes_per_token']:.2f} bytes/token"
                 + (f", weight {d['weight']:.3f}" if len(DATASETS) > 1 else "")
             )
-    BDH_CONFIG = bdh.BDHConfig(
-        n_layer=args.n_layer,
-        n_embd=args.n_embd,
-        n_head=args.n_head,
-        dropout=args.dropout,
-        mlp_internal_dim_multiplier=args.mlp_mult,
-        vocab_size=TOKENIZER.vocab_size,
-    )
+    ARCH = args.arch
+    if ARCH == "bdh":
+        MODEL_CONFIG = bdh.BDHConfig(
+            n_layer=args.n_layer,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            dropout=args.dropout,
+            mlp_internal_dim_multiplier=args.mlp_mult,
+            vocab_size=TOKENIZER.vocab_size,
+        )
+    else:
+        MODEL_CONFIG = gpt.GPTConfig(
+            n_layer=args.n_layer,
+            n_embd=args.n_embd,
+            n_head=args.n_head,
+            dropout=args.dropout,
+            mlp_hidden=args.mlp_hidden,
+            vocab_size=TOKENIZER.vocab_size,
+        )
     BLOCK_SIZE = args.block_size
     BATCH_SIZE = args.batch_size
     GRAD_ACCUM = args.grad_accum
@@ -430,15 +462,17 @@ if __name__ == "__main__":
     RESUME = args.resume
     torch.manual_seed(args.seed)
 
-    raw_model = bdh.BDH(BDH_CONFIG).to(device)
+    raw_model = models.build(ARCH, dataclasses.asdict(MODEL_CONFIG)).to(device)
     n_params = sum(p.numel() for p in raw_model.parameters())
-    print(f"Model parameters: {n_params:,} ({n_params / 1e6:.2f}M)")
+    print(f"Model: {ARCH}, {n_params:,} parameters ({n_params / 1e6:.2f}M)")
     if GRAD_ACCUM > 1:
         print(
             f"Gradient accumulation: {GRAD_ACCUM} micro-batches of {MICRO_BATCH_SIZE} "
             f"= {BATCH_SIZE} sequences ({BATCH_SIZE * BLOCK_SIZE:,} tokens) per step"
         )
     if args.attn_chunk:
+        if ARCH != "bdh":
+            raise SystemExit("--attn-chunk applies to BDH models only")
         raw_model.attn.chunk_size = args.attn_chunk
         print(f"Chunked attention: {args.attn_chunk} tokens per chunk")
     # fused AdamW updates all parameters in a few CUDA kernels instead of several per tensor

@@ -7,7 +7,7 @@ Recipes for training BDH models on FineWeb-Edu:
 | [1. Quick](#recipe-1-quick-d256) | D=256, about 34M parameters, 16K vocabulary | 512 | about 0.65B | **about 64 min (measured)** | Done: 1.1739 bpb, probe 14/50 |
 | [2. Standard](#recipe-2-standard-d512-2048-token-context) | D=512, about 134M parameters, 32K vocabulary | **2048** | about 2.3B | about 14–17 h (estimate) | Planned |
 
-Also on this page: an [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) that decides whether recipe 2 mixes in Wikipedia, and [how to improve fact recall](#improving-fact-recall).
+Also on this page: an [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) that decides whether recipe 2 mixes in Wikipedia, a [comparison of BDH with a GPT](#experiment-bdh-vs-gpt-on-the-quick-recipe) trained the same way, and [how to improve fact recall](#improving-fact-recall).
 
 ## Why FineWeb-Edu
 
@@ -203,6 +203,83 @@ A 34M model has little spare capacity, so new facts may displace old ones. A nul
 | Mix, step 25,000 | 10/50 | not recorded | not recorded |
 | Control, step 30,000 | | | – |
 | Mix, step 30,000 | 11/50 | 1.1745 | 1.2127 |
+
+---
+
+## Experiment: BDH vs. GPT on the quick recipe
+
+Status: **planned, not run yet.**
+
+**Question:** how does BDH compare with a standard transformer trained the same way? The BDH paper reports that BDH matches GPT-2-style transformers at the same parameter count. This tests that claim on your data, and also against a transformer given the same compute.
+
+### Design
+
+Each GPT is a Llama-style transformer ([`--arch gpt`](train.md#gpt-baseline---arch-gpt)) trained exactly like recipe 1: the same data and tokenizer, 20,000 steps of 32K tokens, the same schedule and validation batches. Only the model differs:
+
+| Run | Model | Parameters | Compute per token (estimate) | Checkpoint folder |
+|---|---|---|---|---|
+| BDH (recipe 1) | D=256, 6 shared layers | 33.6M | about 260M multiply-adds | `checkpoints/fwe_d256` |
+| **GPT, equal parameters** | 8 layers, D=512, 8 heads | 34.1M | about 40M | `checkpoints/gpt_d512` |
+| **GPT, equal compute** | 16 layers, D=1024, 16 heads | 219M | about 240M | `checkpoints/gpt_d1024` |
+
+- **Equal parameters** is the paper's comparison. A transformer of this size does about 7× less computation per token, so it should train several times faster.
+- **Equal compute** gives the transformer as much computation per token as BDH. It's a much larger model on the same 655M tokens, only about 3 tokens per parameter, far below the usual 20. So it's undertrained by design: that's what the same compute budget buys a transformer here.
+- **Validation bpb compares directly:** same tokenizer, same validation text, same batches.
+
+### Commands
+
+The data is recipe 1's. **GPT, equal parameters:**
+
+```
+python train.py --arch gpt --data-dir data/fineweb-edu_sp16384 --ckpt-dir checkpoints/gpt_d512 \
+    --n-layer 8 --n-embd 512 --n-head 8 --dropout 0.0 \
+    --block-size 512 --batch-size 64 --grad-accum 1 \
+    --max-iters 20000 --lr 1e-3 --warmup-iters 1000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000
+```
+
+**GPT, equal compute:**
+
+```
+python train.py --arch gpt --data-dir data/fineweb-edu_sp16384 --ckpt-dir checkpoints/gpt_d1024 \
+    --n-layer 16 --n-embd 1024 --n-head 16 --dropout 0.0 \
+    --block-size 512 --batch-size 64 --grad-accum 2 \
+    --max-iters 20000 --lr 6e-4 --warmup-iters 1000 --weight-decay 0.1 \
+    --eval-freq 1000 --snapshot-freq 5000
+```
+
+A transformer of 34M parameters needs far less activation memory than BDH, so `--grad-accum 1` should fit; the 219M model may need 2. `--lr 6e-4` for the larger model follows the usual practice of lower rates for larger models.
+
+**Compare:**
+
+```
+python probe.py checkpoints/fwe_d256/step0020000_bpb1.1734.pt \
+    checkpoints/gpt_d512/latest.pt checkpoints/gpt_d1024/latest.pt --verbose
+python inference.py "Photosynthesis is the process" --checkpoint checkpoints/gpt_d512/latest.pt \
+    --max-new-tokens 300 --top-k 20 --temperature 0.8
+```
+
+### What to look at
+
+| Measure | Where | What it tells you |
+|---|---|---|
+| Validation bpb at step 20,000 | Eval lines | **The main result:** quality at the same parameters, or the same compute, and the same tokens |
+| Validation bpb over time | Eval lines every 1,000 steps | Whether one model learns faster early, or keeps improving longer |
+| Tokens/s and total time | Log lines and the final "Trained … in …" line | Training cost. The equal-parameter GPT should be several times faster |
+| Probe score | `probe.py` | Facts. Differences of up to about 5 are within noise (see the Wikipedia experiment) |
+| Samples | `inference.py` | Coherence and staying on topic, judged by reading |
+
+Generation speed in `inference.py` isn't a fair comparison yet: the GPT has no KV cache, so it re-reads the context for every token, like BDH's default method. BDH's recurrent mode has no GPT equivalent here.
+
+### Results
+
+To be filled in after the runs.
+
+| Run | Parameters | Val bpb, step 20,000 | Probe | Tokens/s | Training time |
+|---|---|---|---|---|---|
+| BDH, recipe 1 | 33.6M | 1.1739 | 14/50 | 172K | about 64 min |
+| GPT, equal parameters | 34.1M | | | | |
+| GPT, equal compute | 219M | | | | |
 
 ---
 

@@ -30,7 +30,7 @@ import random
 import time
 from contextlib import nullcontext
 
-import bdh
+import models
 import torch
 
 import chat_format
@@ -187,7 +187,8 @@ def main():
     config = dict(checkpoint["config"])
     if args.dropout is not None:
         config["dropout"] = args.dropout
-    model = bdh.BDH(bdh.BDHConfig(**config))
+    arch = models.arch_of(checkpoint)
+    model = models.build(arch, config)
     model.load_state_dict(checkpoint["model"])
     model.to(device)
     tok = tokenizers.from_state(checkpoint.get("tokenizer"))
@@ -227,6 +228,8 @@ def main():
         return min_lr + 0.5 * (args.lr - min_lr) * (1 + math.cos(math.pi * progress))
 
     if args.attn_chunk:
+        if arch != "bdh":
+            raise SystemExit("--attn-chunk applies to BDH models only")
         model.attn.chunk_size = args.attn_chunk
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=use_cuda
@@ -248,6 +251,7 @@ def main():
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "step": step,
+            "arch": arch,
             "config": config,
             "block_size": block_size,
             "tokenizer": base_tokenizer_state,
