@@ -291,10 +291,19 @@ def load_checkpoint(model, optimizer):
     # checkpoints from before tokenizer support have no entry and are byte-level
     ckpt_tokenizer = tokenizers.from_state(checkpoint.get("tokenizer"))
     if not tokenizers.same_tokenizer(ckpt_tokenizer, TOKENIZER):
+        same_shape = ckpt_tokenizer.type == TOKENIZER.type and ckpt_tokenizer.vocab_size == TOKENIZER.vocab_size
         raise ValueError(
-            f"Checkpoint {CKPT_PATH} uses a different tokenizer "
-            f"({ckpt_tokenizer.type}, vocab {ckpt_tokenizer.vocab_size}) than the data "
-            f"({TOKENIZER.type}, vocab {TOKENIZER.vocab_size}); use another --ckpt-dir or --no-resume"
+            f"Checkpoint {CKPT_PATH} uses a different tokenizer than the data. "
+            + (
+                f"Both are {TOKENIZER.type} with vocab {TOKENIZER.vocab_size}, but they were trained "
+                "separately, so token ids mean different pieces. Prepare the data with "
+                "prepare_data.py --tokenizer-model pointing to the tokenizer.model of the dataset "
+                "the checkpoint was trained on"
+                if same_shape
+                else f"({ckpt_tokenizer.type}, vocab {ckpt_tokenizer.vocab_size} vs. "
+                f"{TOKENIZER.type}, vocab {TOKENIZER.vocab_size})"
+            )
+            + "; or use another --ckpt-dir or --no-resume"
         )
     if models.arch_of(checkpoint) != ARCH:
         raise ValueError(
