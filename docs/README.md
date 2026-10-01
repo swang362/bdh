@@ -8,13 +8,14 @@ This folder documents the command-line scripts for training and running BDH mode
 | `train.py` | Train a model, with checkpointing, resuming, snapshots and an LR schedule | [train.md](train.md) |
 | `inference.py` | Generate text from a checkpoint | [inference.md](inference.md) |
 | `recurrent.py`, `test_recurrent.py` | Recurrent generation mode (`--recurrent` in `inference.py`, `chat.py` and `probe.py`), and a test that it matches the default method | [recurrent.md](recurrent.md) |
+| `test_chunked.py` | Check chunked attention (`--attn-chunk` in `train.py` and `finetune.py`) against full attention, and time both | [train.md](train.md#chunked-attention-for-long-blocks---attn-chunk) |
 | `probe.py` | Score fact recall of checkpoints with greedy completions | [probe.md](probe.md) |
 | `finetune.py` | Fine-tune a checkpoint on question-and-answer data for chat | [chat.md](chat.md) |
 | `chat.py` | Chat with, or ask questions to, a fine-tuned checkpoint | [chat.md](chat.md) |
 
 Each script also prints its full option list with `--help`.
 
-For measured results, see [benchmarks.md](benchmarks.md).
+For measured results, see [benchmarks.md](benchmarks.md). For a full training recipe with a 2048-token window, see [fineweb-edu-train.md](fineweb-edu-train.md).
 
 ## Setup
 

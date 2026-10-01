@@ -90,6 +90,14 @@ def parse_args():
         "about N times less activation memory; batch-size must be divisible by N",
     )
     g.add_argument("--block-size", type=int, default=BLOCK_SIZE, help="sequence length in tokens")
+    g.add_argument(
+        "--attn-chunk",
+        type=int,
+        default=0,
+        help="compute attention in chunks of N tokens with a running state: cost grows linearly with "
+        "block size instead of quadratically, and no T x T scores are stored. Same model; pays off "
+        "for long blocks (roughly block size > N + 2 * n_embd). 0 computes full attention",
+    )
     g.add_argument("--lr", type=float, default=LEARNING_RATE, help="peak AdamW learning rate")
     g.add_argument(
         "--lr-schedule",
@@ -354,8 +362,15 @@ if __name__ == "__main__":
             f"Gradient accumulation: {GRAD_ACCUM} micro-batches of {MICRO_BATCH_SIZE} "
             f"= {BATCH_SIZE} sequences ({BATCH_SIZE * BLOCK_SIZE:,} tokens) per step"
         )
+    if args.attn_chunk:
+        raw_model.attn.chunk_size = args.attn_chunk
+        print(f"Chunked attention: {args.attn_chunk} tokens per chunk")
+    # fused AdamW updates all parameters in a few CUDA kernels instead of several per tensor
     optimizer = torch.optim.AdamW(
-        raw_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        raw_model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        fused=device.type == "cuda",
     )
     start_step = 0
     if RESUME and os.path.exists(CKPT_PATH):

@@ -26,6 +26,7 @@ With `--data-dir`, the tokenizer, vocab size and data type all come from the dat
 | `--batch-size N` | 32 | Sequences per optimizer step |
 | `--grad-accum N` | 1 | Split each step into N micro-batches of `batch-size / N` sequences. Tokens per step stay the same, activation memory drops about N×, and each step takes somewhat longer. `--batch-size` must be divisible by N |
 | `--block-size N` | 512 | Sequence length in tokens. Saved in the checkpoint and used by `inference.py` as its context window |
+| `--attn-chunk N` | 0 (full attention) | Compute attention in chunks of N tokens with a running state, for long blocks. Same model and results; see [Chunked attention](#chunked-attention-for-long-blocks---attn-chunk) |
 | `--lr LR` | 1e-3 | Peak learning rate, reached at the end of warmup |
 | `--lr-schedule` | `cosine` | `cosine` decays to `--min-lr` by `--max-iters`; `constant` stays at `--lr` after warmup |
 | `--warmup-iters N` | 200 | Steps to ramp up linearly from about 0 to `--lr` |
@@ -100,7 +101,7 @@ Eval step 2500: val loss 1.6601 (2.3951 bpb) | best 1.6543 (2.3867 bpb)
 - **`best.pt`** is the checkpoint with the lowest validation loss so far, saved at evaluation time. It's usually the one to use with `inference.py --checkpoint`, especially if later training overfits. A resumed run remembers the best validation loss, so `best.pt` is only replaced by something better.
 - **Ctrl+C** saves `latest.pt` before exiting. Run the same command again to continue.
 - **What resuming requires:** the same model options (`--n-layer`, `--n-embd`, `--n-head`, `--dropout`, `--mlp-mult`) and the same tokenizer. Otherwise it stops with an error; use a new `--ckpt-dir` or `--no-resume`.
-- **Options you can change when resuming:** `--lr`, `--min-lr`, `--weight-decay`, `--batch-size`, `--block-size` and `--max-iters`. The learning rate is recomputed from the step number. Changing `--max-iters` reshapes the rest of the schedule, and the rate can jump back up.
+- **Options you can change when resuming:** `--lr`, `--min-lr`, `--weight-decay`, `--batch-size`, `--block-size`, `--attn-chunk` and `--max-iters`. The learning rate is recomputed from the step number. Changing `--max-iters` reshapes the rest of the schedule, and the rate can jump back up.
 - **Snapshots** are full checkpoints. Resume from one by copying it over `latest.pt`, or use it directly with `inference.py --checkpoint`. Each snapshot is about 3× the size of the weights, because it includes AdamW's state: about 290MB for the default model. Nothing deletes old snapshots automatically.
 
 ## Recipes
@@ -122,6 +123,9 @@ python train.py ... --n-embd 1024 --lr 3e-4 --grad-accum 8
 # Longer context with the same tokens per step
 python train.py ... --block-size 1024 --batch-size 16
 
+# Long blocks: chunked attention (see below)
+python train.py ... --block-size 4096 --batch-size 8 --attn-chunk 256
+
 # Continue a finished run at a lower learning rate
 python train.py ... --max-iters 50000 --lr 3e-4
 
@@ -129,10 +133,34 @@ python train.py ... --max-iters 50000 --lr 3e-4
 python train.py --lr-schedule constant --warmup-iters 0
 ```
 
+## Chunked attention for long blocks (`--attn-chunk`)
+
+Full attention computes a `block × block` score matrix per head and layer, so its cost grows with the **square** of the block size. With `--attn-chunk N`, attention is computed N tokens at a time:
+- **Inside a chunk,** directly, as before.
+- **Earlier chunks** contribute through a running state S = Σ kᵀv, the same state as recurrent generation ([recurrent.md](recurrent.md)). Each chunk reads S, then adds its own tokens to it.
+
+It's **the same model**: it computes the same values in a different order, so checkpoints, resuming and inference are unaffected. You can turn it on or off when resuming. `test_chunked.py` checks it against full attention, forward and backward.
+
+**When it pays off.** Per token and head, full attention costs about `block × N` multiply-adds (N is the sparse dimension). The chunked form costs about `(chunk + 2 × n_embd) × N`: the chunk itself, plus reading and writing the state, which is `N × n_embd` per head. So it's faster when the block size is above roughly `chunk + 2 × n_embd`, and the gain grows with the block size:
+
+| `--n-embd`, `--attn-chunk` | Break-even block size (estimate) | Attention cost at 2048 | at 4096 | at 8192 |
+|---|---|---|---|---|
+| 256, 128 | about 640 | about 0.3× | 0.16× | 0.08× |
+| 512, 256 | about 1,300 | about 0.6× | 0.3× | 0.16× |
+
+At 512 tokens it's **slower** than full attention for these widths, so leave it off there. Measure on your GPU with `python test_chunked.py --bench --n-embd 512`, which times a training step and peak memory with full and chunked attention for several block sizes and chunk sizes.
+
+**Memory.** No `block × block` matrices are stored, and the backward pass keeps only one state per layer (micro-batch × heads × N × `n_embd` float32 values, about 0.5GB for 4 sequences at `--n-embd 512`): it rebuilds earlier states by subtracting each chunk's contribution. The largest activations, of shape `micro-batch × heads × block × N`, are unchanged, so `--grad-accum` is still the main memory control.
+
+**Precision.** Under bf16 autocast, the matmuls run in bf16 as before, and the state is summed in float32. Results differ from full attention only by rounding.
+
+**`torch.compile`** skips the chunked function and compiles the rest of the model around it.
+
 ## Tips
 
 - **Memory:** the main activation per layer has shape `micro-batch × heads × block × N`. At the defaults that's 32 × 4 × 512 × 8192 = 537M values, about 1GB in bf16 for each such tensor. It grows in proportion to `--n-embd` and `--mlp-mult`: 2× at `--n-embd 512`, 4× at 1024. Use `--grad-accum` first, since lowering `--batch-size` would also change the tokens per step and the training behavior.
 - **Choosing `--grad-accum`:** use the smallest N that fits, because each extra micro-batch adds some overhead. Watch the GPU memory in the first few steps (e.g. with `nvidia-smi`), and double N if you run out of memory.
 - **How long to train:** a common rule of thumb is about 20 tokens per parameter, roughly 500M tokens for 25M parameters. Tokens per step are `batch-size × block-size`, 16,384 by default.
 - **Plateaus:** if the loss stops falling, check the learning rate first. A cosine decay to `--min-lr` usually gives a further drop near the end. Watch the validation loss: if it rises while training loss falls, stop, or use `best.pt`.
+- **Fused AdamW:** on CUDA, the optimizer uses PyTorch's fused AdamW, which updates all parameters in a few kernels instead of several per tensor. It's the same algorithm, and checkpoints from before load normally.
 - **Evaluation cost:** 50 validation batches every 500 steps adds roughly 3% to training time. The first evaluation also triggers a one-off `torch.compile` for evaluation mode.

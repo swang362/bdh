@@ -67,6 +67,7 @@ def parse_args():
         help="split each step into N micro-batches: same examples per step, less memory",
     )
     p.add_argument("--block-size", type=int, default=None, help="max tokens per example (default: the base checkpoint's block size)")
+    p.add_argument("--attn-chunk", type=int, default=0, help="compute attention in chunks of N tokens with a running state, for long blocks (0: full attention)")
     p.add_argument("--lr", type=float, default=1e-4, help="peak learning rate (lower than pretraining)")
     p.add_argument("--min-lr", type=float, default=None, help="final lr of the cosine schedule (default: lr / 10)")
     p.add_argument("--warmup-iters", type=int, default=100)
@@ -225,7 +226,11 @@ def main():
         progress = min(1.0, (step - args.warmup_iters) / max(1, max_iters - args.warmup_iters))
         return min_lr + 0.5 * (args.lr - min_lr) * (1 + math.cos(math.pi * progress))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.attn_chunk:
+        model.attn.chunk_size = args.attn_chunk
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=use_cuda
+    )
     start_step, best_val_loss = 0, float("inf")
     if resuming:
         optimizer.load_state_dict(checkpoint["optimizer"])

@@ -29,6 +29,76 @@ def get_freqs(n, theta, dtype):
     )
 
 
+class ChunkedAttention(torch.autograd.Function):
+    """(Q @ Q.mT).tril(-1) @ V, computed chunk by chunk with a running state.
+
+    Within a chunk, attention is computed directly; earlier chunks contribute
+    through the state S = sum of k^T v over all earlier tokens (B, nh, N, D),
+    as in recurrent.py. Cost grows linearly with T instead of quadratically, and
+    no T x T matrix is formed. The backward pass walks the chunks in reverse and
+    rebuilds each earlier state by subtracting the chunk's k^T v from the final
+    state, so only one state is kept in memory, not one per chunk.
+
+    Q: (B, nh, T, N) rotated sparse activations (also the keys); V: (B, 1, T, D).
+    Matmuls run in Q's dtype (bf16 under autocast); the state is summed in at
+    least float32.
+    """
+
+    @staticmethod
+    def forward(ctx, Q, V, chunk):
+        with torch.autocast(Q.device.type, enabled=False):
+            ctx.v_dtype = V.dtype
+            V = V.to(Q.dtype)
+            B, nh, T, N = Q.shape
+            out = Q.new_empty(B, nh, T, V.size(-1))
+            S = Q.new_zeros(B, nh, N, V.size(-1), dtype=torch.promote_types(Q.dtype, torch.float32))
+            for s in range(0, T, chunk):
+                q, v = Q[:, :, s : s + chunk], V[:, :, s : s + chunk]
+                o = (q @ q.mT).tril(diagonal=-1) @ v
+                if s:
+                    o += q @ S.to(q.dtype)
+                out[:, :, s : s + chunk] = o
+                S += q.mT @ v
+        ctx.save_for_backward(Q, V, S)
+        ctx.chunk = chunk
+        return out
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, V, S = ctx.saved_tensors
+        chunk = ctx.chunk
+        with torch.autocast(Q.device.type, enabled=False):
+            dO = dO.to(Q.dtype)
+            T = Q.size(2)
+            dQ = torch.empty_like(Q)
+            dV = torch.empty_like(V)
+            P = S.clone()  # state before the current chunk
+            G = torch.zeros_like(S)  # sum of q^T dO over later chunks
+            for s in reversed(range(0, T, chunk)):
+                q, v, do = Q[:, :, s : s + chunk], V[:, :, s : s + chunk], dO[:, :, s : s + chunk]
+                P -= q.mT @ v
+                # inside the chunk: o = A v, with A = tril(q q^T); q is both query and key
+                A = (q @ q.mT).tril(diagonal=-1)
+                dA = (do @ v.mT).tril(diagonal=-1)
+                dq = dA @ q + dA.mT @ q
+                dv = A.mT @ do
+                # earlier chunks: o += q P; this chunk's k^T v reaches later chunks through G
+                Gq = G.to(q.dtype)
+                if s:
+                    dq += do @ P.to(q.dtype).mT
+                dq += v @ Gq.mT
+                dv += q @ Gq
+                dQ[:, :, s : s + chunk] = dq
+                dV[:, :, s : s + chunk] = dv.sum(1, keepdim=True)  # V is shared by all heads
+                G += q.mT @ do
+        return dQ, dV.to(ctx.v_dtype), None
+
+
+@torch.compiler.disable
+def chunked_attention(Q, V, chunk):
+    return ChunkedAttention.apply(Q, V, chunk)
+
+
 class Attention(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -39,6 +109,9 @@ class Attention(torch.nn.Module):
         self.freqs = torch.nn.Buffer(
             get_freqs(N, theta=2**16, dtype=torch.float32).view(1, 1, 1, N)
         )
+        # tokens per chunk for ChunkedAttention; None computes the full T x T scores.
+        # Not part of the config: it changes how attention is computed, not the model.
+        self.chunk_size = None
 
     @staticmethod
     def phases_cos_sin(phases):
@@ -68,6 +141,9 @@ class Attention(torch.nn.Module):
         ) * self.freqs
         QR = self.rope(r_phases, Q)
         KR = QR
+
+        if self.chunk_size and T > self.chunk_size:
+            return chunked_attention(QR, V, self.chunk_size)
 
         # Current attention
         scores = (QR @ KR.mT).tril(diagonal=-1)

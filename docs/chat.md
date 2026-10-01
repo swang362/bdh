@@ -67,6 +67,7 @@ python finetune.py --base CHECKPOINT [--data dolly alpaca my_qa.jsonl ...] [opti
 | `--batch-size N` | 32 | Examples per optimizer step |
 | `--grad-accum N` | 1 | Split each step into N micro-batches, for less memory with the same examples per step. Micro-batches are weighted by their number of answer tokens, so the result matches one full batch |
 | `--block-size N` | base checkpoint's | Maximum tokens per example. Longer examples are truncated, and skipped if no answer tokens remain |
+| `--attn-chunk N` | 0 (full attention) | Compute attention in chunks of N tokens with a running state, for long blocks. Same results; see [train.md](train.md#chunked-attention-for-long-blocks---attn-chunk) |
 | `--lr LR` | 1e-4 | Peak learning rate, about 10× lower than pretraining, so the model keeps what it learned |
 | `--min-lr LR` | `lr / 10` | Final learning rate of the cosine schedule |
 | `--warmup-iters N` | 100 | Linear warmup steps |
