@@ -7,7 +7,7 @@ Recipes for training BDH models on FineWeb-Edu:
 | [1. Quick](#recipe-1-quick-d256) | D=256, about 34M parameters, 16K vocabulary | 512 | about 0.65B | **about 64 min (measured)** | Done: 1.1739 bpb, probe 14/50 |
 | [2. Standard](#recipe-2-standard-d512-2048-token-context) | D=512, about 134M parameters, 32K vocabulary | **2048** | about 2.3B | about 14–17 h (estimate) | Planned |
 
-Also on this page: an [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) that decides whether recipe 2 mixes in Wikipedia, a [comparison of BDH with a GPT](#experiment-bdh-vs-gpt-on-the-quick-recipe) trained the same way, and [how to improve fact recall](#improving-fact-recall).
+Also on this page: an [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) on mixing in Wikipedia (no gain at 34M), a [comparison of BDH with a GPT](#experiment-bdh-vs-gpt-on-the-quick-recipe) trained the same way (the GPT wins at both equal parameters and equal compute), and [how to improve fact recall](#improving-fact-recall).
 
 ## Why FineWeb-Edu
 
@@ -72,6 +72,7 @@ On an H100:
 | `wiki_sp16384/best.pt`, step 40,000 | Wikipedia, 2 shards | about 655M | 6/50 (12%) |
 
 **What the results show:**
+- **More training still helps:** continuing to step 30,000 (about 1.4 passes over the shard) brought validation down to **1.1588 bpb**, the control arm of the [Wikipedia experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe). So 20,000 steps leaves the model short of what this data can teach it.
 - **FineWeb-Edu is ahead,** 14 against 6 with the same model size and tokens. Scores move by up to about 5 between nearby checkpoints (see the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe)), so treat this as likely rather than certain. A likely reason is repetition: small models learn a fact only after seeing it many times. Educational pages restate common knowledge constantly, while Wikipedia mostly states each fact once.
 - **The last 5,000 steps added 5 facts** (9 to 14), while the learning rate decayed from about 3e-4 to 1e-4. That would fit the annealing effect, where a model consolidates what it learned as the rate drops. But 4,000 more steps on the same data later lost 5 again (see the experiment), so this is within the probe's noise.
 - **It knows the most-repeated facts:** major dates (1914, 1945, 1789), London and Rome as capitals, water and oxygen, the Earth orbiting the Sun, Darwin and evolution. It missed rarer ones: 1492, 1776, birth years, chemical symbols, currencies.
@@ -83,7 +84,7 @@ On an H100:
 
 ## Experiment: a Wikipedia phase on the quick recipe
 
-Status: **round 1 done (inconclusive), round 2 running.**
+Status: **done.** Result: no measurable gain in facts from Wikipedia at 34M parameters, and a small cost in FineWeb-Edu quality. Recipe 2 keeps stage 2 on FineWeb-Edu only.
 
 **Question:** does a final training phase on a mix of FineWeb-Edu and Wikipedia add facts, beyond what extra training on FineWeb-Edu alone would? It's a cheap test of the [optional Wikipedia mix in recipe 2's stage 2](#option-stage-2-with-wikipedia), and the first real run of dataset mixing in `train.py`.
 
@@ -148,22 +149,18 @@ python train.py --data-dir data/fineweb-edu_sp16384 --ckpt-dir checkpoints/fwe_d
     --eval-freq 1000 --snapshot-freq 5000
 ```
 
-**5. Compare** the base model and several checkpoints per arm:
+**5. Compare** the base model and both arms:
 
 ```
 python probe.py checkpoints/fwe_d256/step0020000_bpb1.1734.pt \
-    checkpoints/fwe_d256/step0025000_*.pt checkpoints/fwe_d256_mix/step0025000_*.pt \
     checkpoints/fwe_d256/latest.pt checkpoints/fwe_d256_mix/latest.pt --verbose
 ```
-
-Probing step 25,000 as well as 30,000 shows how much the score moves between nearby checkpoints of the same arm, a rough measure of probe noise.
 
 ### What to look at
 
 | Measure | Where | What it tells you |
 |---|---|---|
 | Probe score, mix vs. control | `probe.py` | **The main result:** facts added by Wikipedia beyond extra training |
-| Probe score, step 25,000 vs. 30,000 within each arm | `probe.py` | How noisy the probe is. A difference between the arms smaller than this means nothing |
 | FineWeb-Edu validation bpb, mix vs. control | Each arm's eval lines (the mix arm prints one line per dataset) | The cost: how much general text quality the mix gives up. Both arms use the same validation batches, so the numbers compare directly. Also the low-noise check of whether the control improved |
 | Wikipedia validation bpb | The mix arm's eval lines | Whether the model adapts to Wikipedia; it should fall steadily |
 | Which facts changed | `--verbose` output | Whether Wikipedia adds rarer facts, or only shifts which borderline ones are right |
@@ -174,8 +171,8 @@ With 50 probes, differences of up to about 3 facts are within noise, and round 1
 
 | Outcome | For recipe 2 |
 |---|---|
-| Mix beats control by **4 or more** facts at both steps 25,000 and 30,000, with FineWeb-Edu bpb at most about 0.01 worse | Use the Wikipedia mix in stage 2 |
-| Within **3 facts**, or inconsistent between steps | No clear effect at this scale. Keep stage 2 on FineWeb-Edu only, or use a smaller share such as 25% Wikipedia |
+| Mix beats control by **4 or more** facts at step 30,000, with FineWeb-Edu bpb at most about 0.01 worse | Use the Wikipedia mix in stage 2 |
+| Within **3 facts** | No clear effect at this scale. Keep stage 2 on FineWeb-Edu only, or use a smaller share such as 25% Wikipedia |
 | Mix **worse** than control | Keep stage 2 on FineWeb-Edu only |
 
 A 34M model has little spare capacity, so new facts may displace old ones. A null result here doesn't rule out a gain at 134M.
@@ -195,20 +192,27 @@ A 34M model has little spare capacity, so new facts may displace old ones. A nul
 - **Mix against control, 12 against 9,** is within noise: no evidence for or against Wikipedia.
 - **4,000 steps was short for Wikipedia to add facts:** the mix arm saw about 65M Wikipedia tokens, so most facts in it appeared once or not at all. Round 2 extends both arms to 10,000 steps.
 
-**Round 2** (to step 30,000). The control rows are still to be filled in:
+**Round 2** (to step 30,000):
 
 | Checkpoint | Probe score | FineWeb-Edu val bpb | Wikipedia val bpb |
 |---|---|---|---|
-| Control, step 25,000 | | | – |
-| Mix, step 25,000 | 10/50 | not recorded | not recorded |
-| Control, step 30,000 | | | – |
-| Mix, step 30,000 | 11/50 | 1.1745 | 1.2127 |
+| Base, step 20,000 | 14/50 | 1.1739 | – |
+| Control, step 30,000 | **12/50** | **1.1588** | – |
+| Mix, step 30,000 | **11/50** | **1.1745** | 1.2127 |
+
+**Reading round 2:**
+- **Facts: no difference.** Mix against control is 11 against 12, well within noise. Both stay below the base model's 14, as in round 1.
+- **Cost: about 0.016 bpb on FineWeb-Edu.** The control improved from 1.1739 to 1.1588 with 10,000 more steps on FineWeb-Edu. The mix arm stayed at 1.1745, since half its steps went to Wikipedia. That's beyond the 0.01 limit in the decision rule.
+- **Wikipedia was barely absorbed:** the mix arm's Wikipedia bpb is 1.21, against about 1.0 for the Wikipedia-only model on the same validation text, after about 165M Wikipedia tokens.
+- **The probe misses real improvement:** the control's validation bpb improved by 0.015, yet its probe score fell from 14 to 12. At this size, the 50-probe greedy score is too noisy to track small changes; validation bpb is the reliable signal.
+
+**Conclusion:** by the decision rule, recipe 2's stage 2 stays on FineWeb-Edu only. A 34M model has little spare capacity, so this doesn't rule out a gain at 134M, but there's no evidence for one either. A less noisy probe, scoring the likelihood of the right answer rather than greedy matches, would be needed to measure small differences in facts.
 
 ---
 
 ## Experiment: BDH vs. GPT on the quick recipe
 
-Status: **planned, not run yet.**
+Status: **done.** The GPT beat BDH in both comparisons: 0.031 lower validation bpb at the same parameter count while training 5× faster, and 0.106 lower at about the same compute and training time.
 
 **Question:** how does BDH compare with a standard transformer trained the same way? The BDH paper reports that BDH matches GPT-2-style transformers at the same parameter count. This tests that claim on your data, and also against a transformer given the same compute.
 
@@ -273,13 +277,33 @@ Generation speed in `inference.py` isn't a fair comparison yet: the GPT has no K
 
 ### Results
 
-To be filled in after the runs.
-
 | Run | Parameters | Val bpb, step 20,000 | Probe | Tokens/s | Training time |
 |---|---|---|---|---|---|
 | BDH, recipe 1 | 33.6M | 1.1739 | 14/50 | 172K | about 64 min |
-| GPT, equal parameters | 34.1M | | | | |
-| GPT, equal compute | 219M | | | | |
+| **GPT, equal parameters** | 34.1M | **1.1434** | 13/50 | **871K** | **about 12.5 min** |
+| **GPT, equal compute** | 219M | **1.0682** | **16/50** | 196K | about 56 min |
+
+**Reading the equal-parameter result:**
+- **The GPT is better: 0.031 bpb lower** at the same parameters, tokens, schedule and validation batches. It even beats BDH trained 50% longer (1.1588 bpb at step 30,000, from the [Wikipedia experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe)'s control).
+- **And 5× faster to train:** 871K tokens/s against 172K, 12.5 minutes against about 64. That fits the estimate of about 7× less computation per token, with BDH's large element-wise operations adding overhead.
+- **Facts: no difference.** 13 against 14 is within the probe's noise.
+- **Text:** the sample after training is the usual "To be or " prompt with `--top-k 3`, and loops like BDH's. It says little about either model.
+- **So at this size, on this data, the paper's claim doesn't hold up here:** a modern transformer with the same parameter count reached lower loss, at a fifth of the training cost.
+
+**Reading the equal-compute result:**
+- **The GPT is far better: 0.106 bpb lower** than BDH, with about the same computation per token and slightly less training time (about 56 minutes against 64).
+- **Despite being undertrained:** 219M parameters on 655M tokens is about 3 tokens per parameter, far below the usual 20. A transformer still turns the same compute into much lower loss than BDH.
+- **Facts: the best score so far,** 16/50. Two more than BDH is within the probe's noise on its own, but it fits the much lower loss and the larger model's capacity.
+- **Speed per token is about the same as BDH's** (196K tokens/s against 172K), confirming the estimate that BDH does as much computation per token as a 16-layer, D=1024 transformer.
+- **Text:** the sample after training uses the "To be or " prompt with `--top-k 3`, which led it into a list of numbers. It says little.
+
+**Overall:** at this size, on this data, BDH loses to a modern transformer both at equal parameters and at equal compute. BDH's remaining advantage is in inference: constant memory and time per generated token in recurrent mode.
+
+**Caveats:**
+- **One run each, untuned:** both used recipe 1's settings (learning rate 1e-3, warmup 1,000, weight decay 0.1), chosen for BDH. Neither was tuned, so the gap could shrink or grow with tuning. A seed-to-seed difference in validation bpb is usually below 0.005, so 0.031 is unlikely to be noise.
+- **A modern transformer, not GPT-2:** the paper compares with GPT-2-style models. `gpt.py` is Llama-style (RMSNorm, RoPE, SwiGLU), which is typically a few percent better in loss than GPT-2's design.
+- **One size:** the paper reports results from about 10M to 1B parameters. The comparison could differ at other sizes.
+- **Not a comparison of inference:** BDH's recurrent mode gives constant memory and time per generated token; the GPT's grows with context. For long contexts, that can still favor BDH, at a cost in quality per parameter and in training compute.
 
 ---
 
@@ -292,7 +316,7 @@ Status: **planned.** Times are estimates scaled from recipe 1's measured speed, 
 ### The method
 
 1. **Stage 1: train at 512 tokens** for about 85% of the steps. Short blocks are cheap, and the model learns the language there.
-2. **Stage 2: continue at 2048 tokens** for the last 15%, while the learning rate decays. The model learns to use the longer context. Optionally, stage 2 also mixes in Wikipedia, depending on the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe).
+2. **Stage 2: continue at 2048 tokens** for the last 15%, while the learning rate decays. The model learns to use the longer context. The [Wikipedia experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) found no gain from mixing in Wikipedia at 34M parameters, so stage 2 stays on FineWeb-Edu.
 
 Most long-context models are trained this way. Training at 2048 from the start works too, but costs much more for little gain:
 
@@ -355,7 +379,7 @@ It resumes from `checkpoints/fwe_d512/latest.pt` at step 60,000. Keep the step-6
 
 #### Option: stage 2 with Wikipedia
 
-Use this **instead of** the stage 2 command above if the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) shows a gain. Wikipedia is knowledge-dense, and mixing it in while the learning rate decays can improve fact recall (see [Improving fact recall](#improving-fact-recall)).
+Not recommended at present: the [experiment](#experiment-a-wikipedia-phase-on-the-quick-recipe) at 34M parameters found no gain in facts and a cost of about 0.016 bpb on FineWeb-Edu. It's kept here for testing at larger sizes, **instead of** the stage 2 command above. Wikipedia is knowledge-dense, and mixing it in while the learning rate decays can improve fact recall (see [Improving fact recall](#improving-fact-recall)).
 
 Prepare Wikipedia with this recipe's tokenizer, any time before stage 2:
 
